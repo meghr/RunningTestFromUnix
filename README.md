@@ -19,15 +19,16 @@
 test_config.conf
 ***********************************************
 # Repository configuration
-# Use HTTPS URL format for Bitbucket
 REPO_URL=https://bitbucket.org/username/project.git
 BRANCH_NAME=main
 
 # Authentication
-# For token-based auth, use your username and the token as password
 AUTH_USERNAME=your_bitbucket_username
 AUTH_PASSWORD=your_personal_access_token
 
+# Java and Maven configuration
+JAVA_HOME=/path/to/your/specific/jdk
+MAVEN_HOME=/path/to/your/specific/maven
 
 # TestNG XML files (one per line)
 TESTNG_FILES=src/test/resources/testng1.xml
@@ -52,8 +53,6 @@ This ensures only the file owner can read or write to the file.
 -------------------------
 Create run_tests.sh 
 -------------------------
-
-
 #!/bin/bash
 
 # Configuration variables
@@ -90,7 +89,8 @@ REPO_URL=""
 BRANCH_NAME=""
 AUTH_USERNAME=""
 AUTH_PASSWORD=""
-SSH_KEY_PATH=""
+JAVA_HOME=""
+MAVEN_HOME=""
 TESTNG_FILES=()
 
 while IFS='=' read -r key value || [ -n "$key" ]; do
@@ -115,8 +115,11 @@ while IFS='=' read -r key value || [ -n "$key" ]; do
         AUTH_PASSWORD)
             AUTH_PASSWORD="$value"
             ;;
-        SSH_KEY_PATH)
-            SSH_KEY_PATH="$value"
+        JAVA_HOME)
+            JAVA_HOME="$value"
+            ;;
+        MAVEN_HOME)
+            MAVEN_HOME="$value"
             ;;
         TESTNG_FILES)
             TESTNG_FILES+=("$value")
@@ -140,6 +143,34 @@ if [ ${#TESTNG_FILES[@]} -eq 0 ]; then
     exit 1
 fi
 
+# Validate and set up Java and Maven environment
+if [ -n "$JAVA_HOME" ]; then
+    if [ ! -d "$JAVA_HOME" ]; then
+        log "WARNING: Specified JAVA_HOME directory does not exist: $JAVA_HOME" "$SUMMARY_LOG"
+    else
+        log "Using Java from: $JAVA_HOME" "$SUMMARY_LOG"
+        export JAVA_HOME
+        export PATH="$JAVA_HOME/bin:$PATH"
+    fi
+fi
+
+if [ -n "$MAVEN_HOME" ]; then
+    if [ ! -d "$MAVEN_HOME" ]; then
+        log "WARNING: Specified MAVEN_HOME directory does not exist: $MAVEN_HOME" "$SUMMARY_LOG"
+    else
+        log "Using Maven from: $MAVEN_HOME" "$SUMMARY_LOG"
+        export MAVEN_HOME
+        export PATH="$MAVEN_HOME/bin:$PATH"
+    fi
+fi
+
+# Verify Java and Maven versions
+log "Java version:" "$SUMMARY_LOG"
+java -version 2>&1 | tee -a "$SUMMARY_LOG"
+
+log "Maven version:" "$SUMMARY_LOG"
+mvn --version 2>&1 | tee -a "$SUMMARY_LOG"
+
 # Extract repository name from URL
 REPO_NAME=$(basename "$REPO_URL" .git)
 
@@ -147,16 +178,10 @@ log "Starting process for repository: $REPO_NAME" "$SUMMARY_LOG"
 log "Using branch: $BRANCH_NAME" "$SUMMARY_LOG"
 log "TestNG files to run: ${TESTNG_FILES[*]}" "$SUMMARY_LOG"
 
-# Clone the repository with appropriate authentication
+# Clone the repository with token authentication
 log "Cloning repository from $REPO_URL (branch: $BRANCH_NAME)..." "$SUMMARY_LOG"
 
-# Determine authentication method
-if [ -n "$SSH_KEY_PATH" ] && [ -f "$SSH_KEY_PATH" ]; then
-    # Using SSH key
-    log "Using SSH key authentication from $SSH_KEY_PATH" "$SUMMARY_LOG"
-    GIT_SSH_COMMAND="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" git clone -b "$BRANCH_NAME" "$REPO_URL" 2>&1 | tee -a "$BUILD_LOG"
-    CLONE_EXIT_CODE=${PIPESTATUS[0]}
-elif [ -n "$AUTH_USERNAME" ] && [ -n "$AUTH_PASSWORD" ]; then
+if [ -n "$AUTH_USERNAME" ] && [ -n "$AUTH_PASSWORD" ]; then
     # Using username/token
     log "Using username/token authentication" "$SUMMARY_LOG"
     
@@ -187,9 +212,18 @@ cd "$REPO_NAME" || {
     exit 1
 }
 
+# Check for project-specific Maven settings
+if [ -f "mvnw" ]; then
+    log "Using project-specific Maven wrapper" "$SUMMARY_LOG"
+    MVN_CMD="./mvnw"
+    chmod +x mvnw
+else
+    MVN_CMD="mvn"
+fi
+
 # Clean and compile the project
 log "Cleaning and compiling the project..." "$SUMMARY_LOG"
-mvn clean compile 2>&1 | tee -a "../$BUILD_LOG"
+$MVN_CMD clean compile 2>&1 | tee -a "../$BUILD_LOG"
 
 if [ $? -ne 0 ]; then
     log "ERROR: Build failed. Check $BUILD_LOG for details." "$SUMMARY_LOG"
@@ -211,7 +245,7 @@ for testng_xml in "${TESTNG_FILES[@]}"; do
     TEST_SUITE_LOG="../${LOG_DIR}/${TEST_SUITE_NAME}_results.log"
     
     # Run the tests
-    mvn test -DsuiteXmlFile="$testng_xml" 2>&1 | tee "$TEST_SUITE_LOG"
+    $MVN_CMD test -DsuiteXmlFile="$testng_xml" 2>&1 | tee "$TEST_SUITE_LOG"
     
     TEST_EXIT_CODE=${PIPESTATUS[0]}
     
@@ -268,6 +302,9 @@ log "  Individual test suite logs are in the $LOG_DIR directory" "$SUMMARY_LOG"
 cd ..
 
 exit $EXIT_CODE
+
+
+
 
 ## Step 5: Script Make sure to set the script as executable with:
 
