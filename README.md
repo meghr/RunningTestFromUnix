@@ -19,12 +19,11 @@
 test_config.conf
 ***********************************************
 # Repository configuration
-REPO_URL=https://bitbucket.org/username/project.git
+REPO_URL=git@bitbucket.org:username/project.git
 BRANCH_NAME=main
 
-# Authentication
-AUTH_USERNAME=your_bitbucket_username
-AUTH_PASSWORD=your_personal_access_token
+# SSH Authentication
+SSH_KEY_PATH=/path/to/your/private/key
 
 # Java and Maven configuration
 JAVA_HOME=/path/to/your/specific/jdk
@@ -53,6 +52,7 @@ This ensures only the file owner can read or write to the file.
 -------------------------
 Create run_tests.sh 
 -------------------------
+
 #!/bin/bash
 
 # Configuration variables
@@ -87,8 +87,7 @@ mkdir -p "$LOG_DIR"
 # Read configuration from file
 REPO_URL=""
 BRANCH_NAME=""
-AUTH_USERNAME=""
-AUTH_PASSWORD=""
+SSH_KEY_PATH=""
 JAVA_HOME=""
 MAVEN_HOME=""
 TESTNG_FILES=()
@@ -109,11 +108,8 @@ while IFS='=' read -r key value || [ -n "$key" ]; do
         BRANCH_NAME)
             BRANCH_NAME="$value"
             ;;
-        AUTH_USERNAME)
-            AUTH_USERNAME="$value"
-            ;;
-        AUTH_PASSWORD)
-            AUTH_PASSWORD="$value"
+        SSH_KEY_PATH)
+            SSH_KEY_PATH="$value"
             ;;
         JAVA_HOME)
             JAVA_HOME="$value"
@@ -135,6 +131,16 @@ fi
 
 if [ -z "$BRANCH_NAME" ]; then
     log "ERROR: Branch name not specified in configuration file." "$SUMMARY_LOG"
+    exit 1
+fi
+
+if [ -z "$SSH_KEY_PATH" ]; then
+    log "ERROR: SSH key path not specified in configuration file." "$SUMMARY_LOG"
+    exit 1
+fi
+
+if [ ! -f "$SSH_KEY_PATH" ]; then
+    log "ERROR: SSH key not found at $SSH_KEY_PATH" "$SUMMARY_LOG"
     exit 1
 fi
 
@@ -178,39 +184,42 @@ log "Starting process for repository: $REPO_NAME" "$SUMMARY_LOG"
 log "Using branch: $BRANCH_NAME" "$SUMMARY_LOG"
 log "TestNG files to run: ${TESTNG_FILES[*]}" "$SUMMARY_LOG"
 
-# Clone the repository with token authentication
-log "Cloning repository from $REPO_URL (branch: $BRANCH_NAME)..." "$SUMMARY_LOG"
+# Configure SSH for git operations
+export GIT_SSH_COMMAND="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
 
-if [ -n "$AUTH_USERNAME" ] && [ -n "$AUTH_PASSWORD" ]; then
-    # Using username/token
-    log "Using username/token authentication" "$SUMMARY_LOG"
+# Check if repository already exists
+if [ -d "$REPO_NAME" ]; then
+    log "Repository already exists, updating from remote..." "$SUMMARY_LOG"
+    cd "$REPO_NAME" || {
+        log "ERROR: Failed to change to repository directory." "$SUMMARY_LOG"
+        exit 1
+    }
     
-    # Extract protocol and URL parts
-    PROTOCOL=$(echo "$REPO_URL" | grep -o "^[^:]*")
-    URL_PATH=$(echo "$REPO_URL" | sed "s|^[^:]*://||")
+    # Fetch and reset to the specified branch
+    git fetch origin 2>&1 | tee -a "../$BUILD_LOG"
+    git reset --hard "origin/$BRANCH_NAME" 2>&1 | tee -a "../$BUILD_LOG"
+    UPDATE_EXIT_CODE=${PIPESTATUS[1]}
     
-    # Construct URL with credentials
-    AUTH_URL="${PROTOCOL}://${AUTH_USERNAME}:${AUTH_PASSWORD}@${URL_PATH}"
-    
-    git clone -b "$BRANCH_NAME" "$AUTH_URL" 2>&1 | tee -a "$BUILD_LOG"
-    CLONE_EXIT_CODE=${PIPESTATUS[0]}
+    if [ $UPDATE_EXIT_CODE -ne 0 ]; then
+        log "ERROR: Failed to update repository. Check $BUILD_LOG for details." "$SUMMARY_LOG"
+        exit 1
+    }
 else
-    # No authentication provided, try without credentials
-    log "No authentication provided, attempting to clone without credentials" "$SUMMARY_LOG"
+    # Clone the repository
+    log "Cloning repository from $REPO_URL (branch: $BRANCH_NAME)..." "$SUMMARY_LOG"
     git clone -b "$BRANCH_NAME" "$REPO_URL" 2>&1 | tee -a "$BUILD_LOG"
     CLONE_EXIT_CODE=${PIPESTATUS[0]}
+    
+    if [ $CLONE_EXIT_CODE -ne 0 ]; then
+        log "ERROR: Failed to clone repository. Check $BUILD_LOG for details." "$SUMMARY_LOG"
+        exit 1
+    fi
+    
+    cd "$REPO_NAME" || {
+        log "ERROR: Failed to change to repository directory." "$SUMMARY_LOG"
+        exit 1
+    }
 fi
-
-if [ $CLONE_EXIT_CODE -ne 0 ]; then
-    log "ERROR: Failed to clone repository. Check $BUILD_LOG for details." "$SUMMARY_LOG"
-    exit 1
-fi
-
-# Change to the repository directory
-cd "$REPO_NAME" || {
-    log "ERROR: Failed to change to repository directory." "$SUMMARY_LOG"
-    exit 1
-}
 
 # Check for project-specific Maven settings
 if [ -f "mvnw" ]; then
@@ -302,7 +311,6 @@ log "  Individual test suite logs are in the $LOG_DIR directory" "$SUMMARY_LOG"
 cd ..
 
 exit $EXIT_CODE
-
 
 
 
