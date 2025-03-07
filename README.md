@@ -19,11 +19,11 @@
 test_config.conf
 ***********************************************
 # Repository configuration
-REPO_URL=git@bitbucket.org:username/project.git
+REPO_URL=git@altssh.bitbucket.org:username/project.git
 BRANCH_NAME=main
 
 # SSH Authentication
-SSH_KEY_PATH=/path/to/your/private/key
+SSH_KEY_PATH=/custom/path/ssh_keys/id_ed25519
 
 # Java and Maven configuration
 JAVA_HOME=/path/to/your/specific/jdk
@@ -52,6 +52,9 @@ This ensures only the file owner can read or write to the file.
 -------------------------
 Create run_tests.sh 
 -------------------------
+
+
+    
 
 #!/bin/bash
 
@@ -184,8 +187,8 @@ log "Starting process for repository: $REPO_NAME" "$SUMMARY_LOG"
 log "Using branch: $BRANCH_NAME" "$SUMMARY_LOG"
 log "TestNG files to run: ${TESTNG_FILES[*]}" "$SUMMARY_LOG"
 
-# Configure SSH for git operations
-export GIT_SSH_COMMAND="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
+# Configure SSH for git operations with port 443
+export GIT_SSH_COMMAND="ssh -p 443 -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
 
 # Check if repository already exists
 if [ -d "$REPO_NAME" ]; then
@@ -311,7 +314,6 @@ log "  Individual test suite logs are in the $LOG_DIR directory" "$SUMMARY_LOG"
 cd ..
 
 exit $EXIT_CODE
-
 
 
 ## Step 5: Script Make sure to set the script as executable with:
