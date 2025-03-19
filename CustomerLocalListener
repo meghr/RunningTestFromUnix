@@ -1,15 +1,11 @@
 import org.testng.ITestContext;
 import org.testng.ITestListener;
 import org.testng.ITestResult;
-import org.testng.internal.Utils;
 
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -17,7 +13,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 public class SmokeTestHtmlReporter implements ITestListener {
-    private static final String REPORT_FILE = "smoke_test_report.html";
+    // Use an absolute path in the user's home directory
+    private static final String REPORT_FILE = System.getProperty("user.dir") + File.separator + "smoke_test_report.html";
     private long startTime;
     private long endTime;
     private List<TestResultEntry> testResults = new ArrayList<>();
@@ -42,6 +39,7 @@ public class SmokeTestHtmlReporter implements ITestListener {
     public void onStart(ITestContext context) {
         startTime = System.currentTimeMillis();
         System.out.println("Starting test suite: " + context.getName());
+        System.out.println("Report will be generated at: " + REPORT_FILE);
     }
 
     @Override
@@ -52,9 +50,28 @@ public class SmokeTestHtmlReporter implements ITestListener {
         // Generate HTML report
         try {
             generateHtmlReport(context.getName());
-            System.out.println("HTML Report generated at: " + new File(REPORT_FILE).getAbsolutePath());
+            System.out.println("HTML Report successfully generated at: " + REPORT_FILE);
+            
+            // Verify the file was created
+            File reportFile = new File(REPORT_FILE);
+            if (reportFile.exists()) {
+                System.out.println("Report file size: " + reportFile.length() + " bytes");
+            } else {
+                System.out.println("WARNING: Report file was not found after generation attempt!");
+            }
         } catch (IOException e) {
+            System.err.println("ERROR generating HTML report: " + e.getMessage());
             e.printStackTrace();
+            
+            // Attempt to write to a backup location if primary fails
+            try {
+                String backupFile = System.getProperty("java.io.tmpdir") + File.separator + "smoke_test_report_backup.html";
+                System.out.println("Attempting to write report to backup location: " + backupFile);
+                generateHtmlReportToPath(context.getName(), backupFile);
+            } catch (IOException ex) {
+                System.err.println("ERROR generating backup HTML report: " + ex.getMessage());
+                ex.printStackTrace();
+            }
         }
     }
 
@@ -73,6 +90,7 @@ public class SmokeTestHtmlReporter implements ITestListener {
             "",
             duration
         ));
+        System.out.println("Test PASSED: " + getTestName(result));
     }
 
     @Override
@@ -88,6 +106,10 @@ public class SmokeTestHtmlReporter implements ITestListener {
             failureReason,
             duration
         ));
+        System.out.println("Test FAILED: " + getTestName(result));
+        if (result.getThrowable() != null) {
+            System.out.println("Failure reason: " + result.getThrowable().getMessage());
+        }
     }
 
     @Override
@@ -103,6 +125,7 @@ public class SmokeTestHtmlReporter implements ITestListener {
             skipReason,
             duration
         ));
+        System.out.println("Test SKIPPED: " + getTestName(result));
     }
 
     @Override
@@ -115,11 +138,29 @@ public class SmokeTestHtmlReporter implements ITestListener {
     }
 
     private void generateHtmlReport(String suiteName) throws IOException {
-        Path file = Paths.get(REPORT_FILE);
-        try (BufferedWriter writer = Files.newBufferedWriter(file)) {
+        generateHtmlReportToPath(suiteName, REPORT_FILE);
+    }
+    
+    private void generateHtmlReportToPath(String suiteName, String filePath) throws IOException {
+        File reportFile = new File(filePath);
+        
+        // Create parent directories if they don't exist
+        File parentDir = reportFile.getParentFile();
+        if (parentDir != null && !parentDir.exists()) {
+            boolean dirCreated = parentDir.mkdirs();
+            if (!dirCreated) {
+                System.err.println("WARNING: Could not create directory: " + parentDir.getAbsolutePath());
+            }
+        }
+        
+        System.out.println("Writing report to: " + reportFile.getAbsolutePath());
+        
+        try (FileWriter fileWriter = new FileWriter(reportFile);
+             BufferedWriter writer = new BufferedWriter(fileWriter)) {
             writer.write(getHtmlHeader(suiteName));
             writer.write(getResultsTable());
             writer.write(getHtmlFooter());
+            writer.flush();
         }
     }
 
@@ -249,83 +290,29 @@ public class SmokeTestHtmlReporter implements ITestListener {
 
 
 
+# Force a small delay to ensure file system operations complete
+sleep 2
 
-
-<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
-<suite name="Smoke Test Suite">
-  <!-- Add the listener reference here -->
-  <listeners>
-    <listener class-name="SmokeTestHtmlReporter" />
-  </listeners>
-  
-  <!-- Your existing test configuration -->
-  <test name="Smoke Tests">
-    <groups>
-      <run>
-        <include name="smokeTest" />
-      </run>
-    </groups>
-    <packages>
-      <package name="your.package.name.*" />
-    </packages>
-  </test>
-</suite>
-
-
-
-#!/bin/bash
-
-# Configuration
-EMAIL_RECIPIENTS="your.email@example.com,team@example.com"
-PROJECT_NAME="Your Project Name"
-TEST_REPORT="smoke_test_report.html"
-TESTNG_XML="smoke-tests.xml"
-EMAIL_SUBJECT="$PROJECT_NAME - Smoke Test Results"
-
-# Directory for the custom listener class
-LISTENER_DIR="./custom-listeners"
-
-# Create listener directory if it doesn't exist
-mkdir -p $LISTENER_DIR
-
-# Save the listener class to a file
-cat > $LISTENER_DIR/SmokeTestHtmlReporter.java << 'EOF'
-// Paste the entire SmokeTestHtmlReporter.java code here
-// This will be populated during script execution
-EOF
-
-# Compile the listener class
-echo "Compiling custom TestNG listener..."
-javac -cp ".:$(mvn dependency:build-classpath -q):target/test-classes" $LISTENER_DIR/SmokeTestHtmlReporter.java
-# Copy the compiled class to the test classpath
-cp $LISTENER_DIR/SmokeTestHtmlReporter.class target/test-classes/
-
-# Run the tests with Maven
-echo "Running Smoke Tests..."
-mvn test -DsuiteXmlFile=$TESTNG_XML
-
-# Check if the report was generated
+# First check if the report was generated in the current directory
 if [ -f "$TEST_REPORT" ]; then
-    echo "Test report generated successfully"
-    
-    # Create email content
-    EMAIL_BODY=$(cat << EOF
-Smoke Test Results for $PROJECT_NAME
-
-Please see the attached HTML report for detailed test results.
-
-This is an automated email. Please do not reply.
-EOF
-)
-
-    # Send email with the report as attachment
-    echo "Sending email report to $EMAIL_RECIPIENTS"
-    echo "$EMAIL_BODY" | mail -s "$EMAIL_SUBJECT" -a "$TEST_REPORT" $EMAIL_RECIPIENTS
-    
-    echo "Email sent successfully!"
+    echo "Test report generated successfully at $(pwd)/$TEST_REPORT"
+    REPORT_PATH="$TEST_REPORT"
 else
-    echo "ERROR: Test report was not generated!"
-    exit 1
+    # Try to find the report file anywhere in the project directory
+    REPORT_PATH=$(find $(pwd) -name "$TEST_REPORT" -type f | head -1)
+    
+    if [ -n "$REPORT_PATH" ]; then
+        echo "Found test report at: $REPORT_PATH"
+    else
+        echo "WARNING: Test report not found in current directory."
+        # Check temp directory for backup report
+        BACKUP_REPORT="/tmp/smoke_test_report_backup.html"
+        if [ -f "$BACKUP_REPORT" ]; then
+            echo "Found backup report at: $BACKUP_REPORT"
+            REPORT_PATH="$BACKUP_REPORT"
+        else
+            echo "ERROR: No test report found!"
+            exit 1
+        fi
+    fi
 fi
-
-echo "Smoke Test run complete!"
