@@ -1,0 +1,331 @@
+import org.testng.ITestContext;
+import org.testng.ITestListener;
+import org.testng.ITestResult;
+import org.testng.internal.Utils;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+public class SmokeTestHtmlReporter implements ITestListener {
+    private static final String REPORT_FILE = "smoke_test_report.html";
+    private long startTime;
+    private long endTime;
+    private List<TestResultEntry> testResults = new ArrayList<>();
+
+    static class TestResultEntry {
+        String className;
+        String methodName;
+        String status;
+        String failureReason;
+        long duration;
+
+        public TestResultEntry(String className, String methodName, String status, String failureReason, long duration) {
+            this.className = className;
+            this.methodName = methodName;
+            this.status = status;
+            this.failureReason = failureReason;
+            this.duration = duration;
+        }
+    }
+
+    @Override
+    public void onStart(ITestContext context) {
+        startTime = System.currentTimeMillis();
+        System.out.println("Starting test suite: " + context.getName());
+    }
+
+    @Override
+    public void onFinish(ITestContext context) {
+        endTime = System.currentTimeMillis();
+        System.out.println("Finished test suite: " + context.getName());
+        
+        // Generate HTML report
+        try {
+            generateHtmlReport(context.getName());
+            System.out.println("HTML Report generated at: " + new File(REPORT_FILE).getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onTestStart(ITestResult result) {
+        System.out.println("Starting test: " + getTestName(result));
+    }
+
+    @Override
+    public void onTestSuccess(ITestResult result) {
+        long duration = result.getEndMillis() - result.getStartMillis();
+        testResults.add(new TestResultEntry(
+            result.getTestClass().getName(), 
+            result.getMethod().getMethodName(),
+            "PASS",
+            "",
+            duration
+        ));
+    }
+
+    @Override
+    public void onTestFailure(ITestResult result) {
+        long duration = result.getEndMillis() - result.getStartMillis();
+        String failureReason = result.getThrowable() != null ? 
+            result.getThrowable().getMessage() : "Unknown failure";
+            
+        testResults.add(new TestResultEntry(
+            result.getTestClass().getName(), 
+            result.getMethod().getMethodName(),
+            "FAIL",
+            failureReason,
+            duration
+        ));
+    }
+
+    @Override
+    public void onTestSkipped(ITestResult result) {
+        long duration = result.getEndMillis() - result.getStartMillis();
+        String skipReason = result.getThrowable() != null ? 
+            result.getThrowable().getMessage() : "Test skipped";
+            
+        testResults.add(new TestResultEntry(
+            result.getTestClass().getName(), 
+            result.getMethod().getMethodName(),
+            "SKIP",
+            skipReason,
+            duration
+        ));
+    }
+
+    @Override
+    public void onTestFailedButWithinSuccessPercentage(ITestResult result) {
+        onTestFailure(result);
+    }
+
+    private String getTestName(ITestResult result) {
+        return result.getTestClass().getName() + "." + result.getMethod().getMethodName();
+    }
+
+    private void generateHtmlReport(String suiteName) throws IOException {
+        Path file = Paths.get(REPORT_FILE);
+        try (BufferedWriter writer = Files.newBufferedWriter(file)) {
+            writer.write(getHtmlHeader(suiteName));
+            writer.write(getResultsTable());
+            writer.write(getHtmlFooter());
+        }
+    }
+
+    private String getHtmlHeader(String suiteName) {
+        long totalDuration = endTime - startTime;
+        String durationStr = formatDuration(totalDuration);
+        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        String runDate = dateFormat.format(new Date(startTime));
+        
+        int totalTests = testResults.size();
+        int passed = (int) testResults.stream().filter(r -> "PASS".equals(r.status)).count();
+        int failed = (int) testResults.stream().filter(r -> "FAIL".equals(r.status)).count();
+        int skipped = (int) testResults.stream().filter(r -> "SKIP".equals(r.status)).count();
+        
+        StringBuilder html = new StringBuilder();
+        html.append("<!DOCTYPE html>\n");
+        html.append("<html lang=\"en\">\n");
+        html.append("<head>\n");
+        html.append("    <meta charset=\"UTF-8\">\n");
+        html.append("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+        html.append("    <title>Smoke Test Results</title>\n");
+        html.append("    <style>\n");
+        html.append("        body { font-family: Arial, sans-serif; margin: 20px; }\n");
+        html.append("        h1 { color: #333; }\n");
+        html.append("        .summary { background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }\n");
+        html.append("        .pass { background-color: #dff0d8; color: #3c763d; }\n");
+        html.append("        .fail { background-color: #f2dede; color: #a94442; }\n");
+        html.append("        .skip { background-color: #fcf8e3; color: #8a6d3b; }\n");
+        html.append("        table { width: 100%; border-collapse: collapse; margin-top: 20px; }\n");
+        html.append("        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }\n");
+        html.append("        th { background-color: #4CAF50; color: white; }\n");
+        html.append("        tr:hover { background-color: #f5f5f5; }\n");
+        html.append("        .result-pass { color: green; font-weight: bold; }\n");
+        html.append("        .result-fail { color: red; font-weight: bold; }\n");
+        html.append("        .result-skip { color: orange; font-weight: bold; }\n");
+        html.append("        .reason { max-width: 400px; overflow-wrap: break-word; }\n");
+        html.append("    </style>\n");
+        html.append("</head>\n");
+        html.append("<body>\n");
+        html.append("    <h1>Smoke Test Results</h1>\n");
+        html.append("    <div class=\"summary\">\n");
+        html.append("        <h2>Test Suite: ").append(suiteName).append("</h2>\n");
+        html.append("        <p><strong>Run Date:</strong> ").append(runDate).append("</p>\n");
+        html.append("        <p><strong>Total Duration:</strong> ").append(durationStr).append("</p>\n");
+        html.append("        <p><strong>Total Tests:</strong> ").append(totalTests).append("</p>\n");
+        html.append("        <p class=\"result-pass\"><strong>Passed:</strong> ").append(passed).append("</p>\n");
+        html.append("        <p class=\"result-fail\"><strong>Failed:</strong> ").append(failed).append("</p>\n");
+        html.append("        <p class=\"result-skip\"><strong>Skipped:</strong> ").append(skipped).append("</p>\n");
+        html.append("    </div>\n");
+        
+        return html.toString();
+    }
+    
+    private String getResultsTable() {
+        StringBuilder html = new StringBuilder();
+        html.append("    <h2>Test Results</h2>\n");
+        html.append("    <table>\n");
+        html.append("        <thead>\n");
+        html.append("            <tr>\n");
+        html.append("                <th>Class Name</th>\n");
+        html.append("                <th>Method Name</th>\n");
+        html.append("                <th>Status</th>\n");
+        html.append("                <th>Duration (ms)</th>\n");
+        html.append("                <th>Failure Reason</th>\n");
+        html.append("            </tr>\n");
+        html.append("        </thead>\n");
+        html.append("        <tbody>\n");
+        
+        for (TestResultEntry result : testResults) {
+            String rowClass = "";
+            String statusClass = "";
+            
+            switch (result.status) {
+                case "PASS":
+                    rowClass = "pass";
+                    statusClass = "result-pass";
+                    break;
+                case "FAIL":
+                    rowClass = "fail";
+                    statusClass = "result-fail";
+                    break;
+                case "SKIP":
+                    rowClass = "skip";
+                    statusClass = "result-skip";
+                    break;
+            }
+            
+            html.append("            <tr class=\"").append(rowClass).append("\">\n");
+            html.append("                <td>").append(result.className).append("</td>\n");
+            html.append("                <td>").append(result.methodName).append("</td>\n");
+            html.append("                <td class=\"").append(statusClass).append("\">").append(result.status).append("</td>\n");
+            html.append("                <td>").append(result.duration).append("</td>\n");
+            html.append("                <td class=\"reason\">").append(escapeHtml(result.failureReason)).append("</td>\n");
+            html.append("            </tr>\n");
+        }
+        
+        html.append("        </tbody>\n");
+        html.append("    </table>\n");
+        
+        return html.toString();
+    }
+    
+    private String getHtmlFooter() {
+        return "</body>\n</html>";
+    }
+    
+    private String formatDuration(long millis) {
+        long minutes = TimeUnit.MILLISECONDS.toMinutes(millis);
+        long seconds = TimeUnit.MILLISECONDS.toSeconds(millis) - 
+                       TimeUnit.MINUTES.toSeconds(minutes);
+        long ms = millis - TimeUnit.MINUTES.toMillis(minutes) - 
+                  TimeUnit.SECONDS.toMillis(seconds);
+                  
+        return String.format("%d min, %d sec, %d ms", minutes, seconds, ms);
+    }
+    
+    private String escapeHtml(String input) {
+        if (input == null) return "";
+        return input.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;")
+                   .replace("\"", "&quot;")
+                   .replace("'", "&#39;");
+    }
+}
+
+
+
+
+
+
+<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<suite name="Smoke Test Suite">
+  <!-- Add the listener reference here -->
+  <listeners>
+    <listener class-name="SmokeTestHtmlReporter" />
+  </listeners>
+  
+  <!-- Your existing test configuration -->
+  <test name="Smoke Tests">
+    <groups>
+      <run>
+        <include name="smokeTest" />
+      </run>
+    </groups>
+    <packages>
+      <package name="your.package.name.*" />
+    </packages>
+  </test>
+</suite>
+
+
+
+#!/bin/bash
+
+# Configuration
+EMAIL_RECIPIENTS="your.email@example.com,team@example.com"
+PROJECT_NAME="Your Project Name"
+TEST_REPORT="smoke_test_report.html"
+TESTNG_XML="smoke-tests.xml"
+EMAIL_SUBJECT="$PROJECT_NAME - Smoke Test Results"
+
+# Directory for the custom listener class
+LISTENER_DIR="./custom-listeners"
+
+# Create listener directory if it doesn't exist
+mkdir -p $LISTENER_DIR
+
+# Save the listener class to a file
+cat > $LISTENER_DIR/SmokeTestHtmlReporter.java << 'EOF'
+// Paste the entire SmokeTestHtmlReporter.java code here
+// This will be populated during script execution
+EOF
+
+# Compile the listener class
+echo "Compiling custom TestNG listener..."
+javac -cp ".:$(mvn dependency:build-classpath -q):target/test-classes" $LISTENER_DIR/SmokeTestHtmlReporter.java
+# Copy the compiled class to the test classpath
+cp $LISTENER_DIR/SmokeTestHtmlReporter.class target/test-classes/
+
+# Run the tests with Maven
+echo "Running Smoke Tests..."
+mvn test -DsuiteXmlFile=$TESTNG_XML
+
+# Check if the report was generated
+if [ -f "$TEST_REPORT" ]; then
+    echo "Test report generated successfully"
+    
+    # Create email content
+    EMAIL_BODY=$(cat << EOF
+Smoke Test Results for $PROJECT_NAME
+
+Please see the attached HTML report for detailed test results.
+
+This is an automated email. Please do not reply.
+EOF
+)
+
+    # Send email with the report as attachment
+    echo "Sending email report to $EMAIL_RECIPIENTS"
+    echo "$EMAIL_BODY" | mail -s "$EMAIL_SUBJECT" -a "$TEST_REPORT" $EMAIL_RECIPIENTS
+    
+    echo "Email sent successfully!"
+else
+    echo "ERROR: Test report was not generated!"
+    exit 1
+fi
+
+echo "Smoke Test run complete!"
