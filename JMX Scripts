@@ -104,3 +104,31 @@ public class InvokeJmxOperation {
         }
     }
 }
+
+
+
+Regarding your questions:
+
+The key changes in the script are:
+
+Changed from using an attribute (ATTRIBUTE_NAME) to calling an operation (OPERATION_NAME)
+Changed the Java class name from GetJmxVersion to InvokeJmxOperation which is designed to call methods instead of retrieving attributes
+
+
+For the JAVA_CLASS_PATH:
+
+This should be the directory path where your Java class file is located
+It's not the Java bin directory (like the one from your JDK installation)
+In the script, JAVA_CLASS_PATH="." means "current directory" - so the Java file should be in the same directory where you run the script
+If your Java files are in a different location, provide the full path, such as JAVA_CLASS_PATH="/home/user/jmx_tools"
+
+
+Before running the script:
+
+Make sure to place the InvokeJmxOperation.java file in the directory specified by JAVA_CLASS_PATH
+Make sure you have Java Development Kit (JDK) installed so that javac is available for compiling
+Update the configuration variables at the top of the script to match your environment
+
+
+
+The script will compile the Java class if needed, then use it to call the getBuildVersion() operation on your MBean and pass the result to your target script.
