@@ -1,0 +1,137 @@
+JMX Call Scripts 
+
+import java.util.HashMap;
+import java.util.Map;
+import javax.management.MBeanServerConnection;
+import javax.management.ObjectName;
+import javax.management.remote.JMXConnector;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
+
+public class GetJmxVersion {
+    public static void main(String[] args) {
+        if (args.length < 4) {
+            System.err.println("Usage: java GetJmxVersion <host> <port> <mbean> <attribute> [username] [password]");
+            System.exit(1);
+        }
+
+        String host = args[0];
+        String port = args[1];
+        String mbeanName = args[2];
+        String attributeName = args[3];
+        String username = args.length > 4 ? args[4] : null;
+        String password = args.length > 5 ? args[5] : null;
+
+        try {
+            JMXServiceURL url = new JMXServiceURL("service:jmx:rmi:///jndi/rmi://" + host + ":" + port + "/jmxrmi");
+           
+            JMXConnector jmxConnector;
+            if (username != null && !username.isEmpty()) {
+                Map<String, Object> env = new HashMap<>();
+                String[] credentials = {username, password};
+                env.put(JMXConnector.CREDENTIALS, credentials);
+                jmxConnector = JMXConnectorFactory.connect(url, env);
+            } else {
+                jmxConnector = JMXConnectorFactory.connect(url);
+            }
+           
+            MBeanServerConnection mbsc = jmxConnector.getMBeanServerConnection();
+            ObjectName objectName = new ObjectName(mbeanName);
+            Object value = mbsc.getAttribute(objectName, attributeName);
+           
+            System.out.println(value.toString());
+            jmxConnector.close();
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+} 
+
+
+
+
+
+
+Script
+
+
+#!/bin/bash
+
+# Configuration variables
+REMOTE_HOST="remote-host.example.com"
+REMOTE_PORT="9999" # JMX port of the remote application
+JMX_USERNAME="" # Leave empty if no authentication required
+JMX_PASSWORD="" # Leave empty if no authentication required
+MBEAN_NAME="com.example:type=Application,name=VersionInfo"
+ATTRIBUTE_NAME="Version"
+TARGET_SCRIPT="/path/to/your/script.sh"
+JAVA_CLASS_PATH="." # Path to the directory containing GetJmxVersion.class
+
+# Check if the Java class exists and compile if needed
+if [ ! -f "${JAVA_CLASS_PATH}/GetJmxVersion.class" ]; then
+    if [ ! -f "${JAVA_CLASS_PATH}/GetJmxVersion.java" ]; then
+        echo "Error: GetJmxVersion.java not found in ${JAVA_CLASS_PATH}"
+        exit 1
+    fi
+    
+    echo "Compiling GetJmxVersion.java..."
+    javac "${JAVA_CLASS_PATH}/GetJmxVersion.java"
+    
+    if [ $? -ne 0 ]; then
+        echo "Failed to compile Java program."
+        exit 1
+    fi
+fi
+
+# Run the Java program to get the version via JMX
+if [ -n "$JMX_USERNAME" ]; then
+    VERSION=$(java -cp "$JAVA_CLASS_PATH" GetJmxVersion "$REMOTE_HOST" "$REMOTE_PORT" "$MBEAN_NAME" "$ATTRIBUTE_NAME" "$JMX_USERNAME" "$JMX_PASSWORD")
+else
+    VERSION=$(java -cp "$JAVA_CLASS_PATH" GetJmxVersion "$REMOTE_HOST" "$REMOTE_PORT" "$MBEAN_NAME" "$ATTRIBUTE_NAME")
+fi
+
+# Check if VERSION was successfully retrieved
+if [ $? -ne 0 ] || [ -z "$VERSION" ]; then
+    echo "Failed to retrieve version information."
+    exit 1
+fi
+
+echo "Retrieved application version: $VERSION"
+
+# Execute the target script with the version as parameter
+echo "Executing target script with version parameter..."
+$TARGET_SCRIPT "$VERSION"
+
+exit 0
+
+
+
+
+
+## Setup Instructions
+
+1. First, save the Java code in a file named `GetJmxVersion.java`
+2. Save the bash script as `get_app_version.sh`
+3. Make the bash script executable: `chmod +x get_app_version.sh`
+4. Adjust the configuration variables in the bash script:
+   - `REMOTE_HOST`: Target application's hostname/IP
+   - `REMOTE_PORT`: JMX port
+   - `MBEAN_NAME`: The MBean exposing the version
+   - `ATTRIBUTE_NAME`: The attribute containing the version
+   - `TARGET_SCRIPT`: Your script that needs the version parameter
+   - `JMX_USERNAME` and `JMX_PASSWORD`: If authentication is required
+   - `JAVA_CLASS_PATH`: Path to the directory containing the Java file
+
+## How to Run
+
+1. Compile the Java file (the script will do this automatically if needed):
+   ```
+   javac GetJmxVersion.java
+   ```
+
+2. Run the script:
+   ```
+   ./get_app_version.sh
+   ```
