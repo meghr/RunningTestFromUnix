@@ -1,3 +1,501 @@
+without json 
+
+
+package com.test.listeners;
+
+import org.testng.IExecutionListener;
+import org.testng.ITestContext;
+import org.testng.ITestListener;
+import org.testng.ITestResult;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileLock;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class HTMLReportListener implements ITestListener, IExecutionListener {
+
+    // File paths for persistence
+    private static final String RESULTS_FILE_PATH = "test-results.txt";
+    private static final String SUMMARY_FILE_PATH = "test-summary.txt";
+    private static final String REPORT_PATH = "test-execution-report.html";
+    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+    
+    // Delimiter for the CSV-style storage
+    private static final String DELIMITER = "|||";
+
+    // Current execution tracking
+    private final ConcurrentHashMap<String, TestResult> currentResults = new ConcurrentHashMap<>();
+    private final AtomicInteger currentPassCount = new AtomicInteger(0);
+    private final AtomicInteger currentFailCount = new AtomicInteger(0);
+    private final AtomicInteger currentSkipCount = new AtomicInteger(0);
+    
+    // Execution time tracking for current execution
+    private long suiteStartTime = 0;
+    private long suiteEndTime = 0;
+    private String currentSuiteName = "";
+
+    private static class TestResult {
+        String suiteName;
+        String testName;
+        String status;
+        String reason;
+        long duration;
+        
+        public TestResult(String suiteName, String testName, String status, String reason, long duration) {
+            this.suiteName = suiteName;
+            this.testName = testName;
+            this.status = status;
+            this.reason = reason != null ? reason : "";
+            this.duration = duration;
+        }
+        
+        public String toCSVLine() {
+            return suiteName + DELIMITER + 
+                   testName + DELIMITER + 
+                   status + DELIMITER + 
+                   escapeDelimiters(reason) + DELIMITER + 
+                   duration;
+        }
+        
+        private String escapeDelimiters(String input) {
+            if (input == null) return "";
+            return input.replace(DELIMITER, "[DELIM]");
+        }
+        
+        public static TestResult fromCSVLine(String line) {
+            String[] parts = line.split(Pattern.quote(DELIMITER), -1);
+            if (parts.length >= 5) {
+                String reason = parts[3].replace("[DELIM]", DELIMITER);
+                return new TestResult(
+                    parts[0],
+                    parts[1],
+                    parts[2],
+                    reason,
+                    Long.parseLong(parts[4])
+                );
+            }
+            return null;
+        }
+    }
+
+    private static class SummaryData {
+        long passCount;
+        long failCount;
+        long skipCount;
+        long firstStartTime;
+        long lastEndTime;
+        
+        public SummaryData() {
+            this.passCount = 0;
+            this.failCount = 0;
+            this.skipCount = 0;
+            this.firstStartTime = 0;
+            this.lastEndTime = 0;
+        }
+        
+        public String toCSVLine() {
+            return passCount + DELIMITER + 
+                   failCount + DELIMITER + 
+                   skipCount + DELIMITER + 
+                   firstStartTime + DELIMITER + 
+                   lastEndTime;
+        }
+        
+        public static SummaryData fromCSVLine(String line) {
+            SummaryData data = new SummaryData();
+            if (line != null && !line.trim().isEmpty()) {
+                String[] parts = line.split(Pattern.quote(DELIMITER), -1);
+                if (parts.length >= 5) {
+                    data.passCount = Long.parseLong(parts[0]);
+                    data.failCount = Long.parseLong(parts[1]);
+                    data.skipCount = Long.parseLong(parts[2]);
+                    data.firstStartTime = Long.parseLong(parts[3]);
+                    data.lastEndTime = Long.parseLong(parts[4]);
+                }
+            }
+            return data;
+        }
+    }
+
+    @Override
+    public void onStart(ITestContext context) {
+        suiteStartTime = System.currentTimeMillis();
+        currentSuiteName = context.getSuite().getName();
+        
+        // Initialize summary file if it doesn't exist
+        File summaryFile = new File(SUMMARY_FILE_PATH);
+        if (!summaryFile.exists()) {
+            createInitialSummaryFile();
+        }
+    }
+
+    @Override
+    public void onFinish(ITestContext context) {
+        suiteEndTime = System.currentTimeMillis();
+        
+        // Save current execution results
+        persistCurrentExecutionData();
+        
+        // Generate consolidated report
+        generateReport();
+    }
+
+    @Override
+    public void onTestSuccess(ITestResult result) {
+        String testName = result.getMethod().getMethodName();
+        long duration = result.getEndMillis() - result.getStartMillis();
+        
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "PASS", "", duration));
+        currentPassCount.incrementAndGet();
+    }
+
+    @Override
+    public void onTestFailure(ITestResult result) {
+        String testName = result.getMethod().getMethodName();
+        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Unknown failure";
+        long duration = result.getEndMillis() - result.getStartMillis();
+        
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "FAIL", reason, duration));
+        currentFailCount.incrementAndGet();
+    }
+
+    @Override
+    public void onTestSkipped(ITestResult result) {
+        String testName = result.getMethod().getMethodName();
+        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Test skipped";
+        
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "SKIP", reason, 0));
+        currentSkipCount.incrementAndGet();
+    }
+
+    @Override
+    public void onExecutionStart() {
+        // Not using this for cross-JVM functionality
+    }
+
+    @Override
+    public void onExecutionFinish() {
+        // Make sure all results are saved
+        persistCurrentExecutionData();
+    }
+    
+    @Override
+    public void onTestStart(ITestResult result) {
+        // Not needed for this implementation
+    }
+
+    private void persistCurrentExecutionData() {
+        FileLock lock = null;
+        RandomAccessFile raf = null;
+        
+        try {
+            // Use file locking to ensure thread safety across JVMs
+            raf = new RandomAccessFile(RESULTS_FILE_PATH + ".lock", "rw");
+            lock = raf.getChannel().lock();
+            
+            // 1. Save test results to file
+            saveCurrentTestResults();
+            
+            // 2. Update summary with current execution
+            updateSummary();
+            
+        } catch (Exception e) {
+            System.err.println("Error persisting execution data: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            try {
+                if (lock != null) lock.release();
+                if (raf != null) raf.close();
+            } catch (IOException e) {
+                System.err.println("Error releasing file lock: " + e.getMessage());
+            }
+        }
+    }
+    
+    private void saveCurrentTestResults() throws IOException {
+        // Append current results to the results file
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(RESULTS_FILE_PATH, true))) {
+            for (TestResult result : currentResults.values()) {
+                writer.write(result.toCSVLine());
+                writer.newLine();
+            }
+        }
+    }
+    
+    private void updateSummary() throws IOException {
+        SummaryData summary = readSummaryFile();
+        
+        // Update counts
+        summary.passCount += currentPassCount.get();
+        summary.failCount += currentFailCount.get();
+        summary.skipCount += currentSkipCount.get();
+        
+        // Update time tracking
+        if (summary.firstStartTime == 0) {
+            summary.firstStartTime = suiteStartTime;
+        }
+        
+        // Always update last end time
+        if (suiteEndTime > 0) {
+            summary.lastEndTime = suiteEndTime;
+        }
+        
+        // Write the updated summary
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(SUMMARY_FILE_PATH))) {
+            writer.write(summary.toCSVLine());
+        }
+    }
+    
+    private SummaryData readSummaryFile() throws IOException {
+        File summaryFile = new File(SUMMARY_FILE_PATH);
+        
+        if (summaryFile.exists()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(summaryFile))) {
+                String line = reader.readLine();
+                return SummaryData.fromCSVLine(line);
+            }
+        } else {
+            return createInitialSummaryFile();
+        }
+    }
+    
+    private SummaryData createInitialSummaryFile() {
+        SummaryData summary = new SummaryData();
+        
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(SUMMARY_FILE_PATH))) {
+            writer.write(summary.toCSVLine());
+        } catch (IOException e) {
+            System.err.println("Error creating summary file: " + e.getMessage());
+        }
+        
+        return summary;
+    }
+
+    private void generateReport() {
+        FileLock lock = null;
+        RandomAccessFile raf = null;
+        
+        try {
+            // Use file locking to ensure thread safety
+            raf = new RandomAccessFile(REPORT_PATH + ".lock", "rw");
+            lock = raf.getChannel().lock();
+            
+            // Load summary data
+            SummaryData summary = readSummaryFile();
+            
+            // Load all test results
+            List<TestResult> allResults = loadAllTestResults();
+            
+            // Create HTML report
+            StringBuilder html = new StringBuilder();
+            html.append("<!DOCTYPE html>\n");
+            html.append("<html lang=\"en\">\n");
+            html.append("<head>\n");
+            html.append("    <meta charset=\"UTF-8\">\n");
+            html.append("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+            html.append("    <title>Test Execution Report</title>\n");
+            html.append("    <style>\n");
+            html.append("        body { font-family: Arial, sans-serif; margin: 20px; }\n");
+            html.append("        .summary { background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }\n");
+            html.append("        table { width: 100%; border-collapse: collapse; }\n");
+            html.append("        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }\n");
+            html.append("        th { background-color: #f2f2f2; }\n");
+            html.append("        .pass { background-color: #dff0d8; color: #3c763d; }\n");
+            html.append("        .fail { background-color: #f2dede; color: #a94442; }\n");
+            html.append("        .skip { background-color: #fcf8e3; color: #8a6d3b; }\n");
+            html.append("        .timestamp { font-size: 12px; color: #777; margin-top: 5px; }\n");
+            html.append("        .filter-controls { margin-bottom: 15px; }\n");
+            html.append("        .search-box { padding: 5px; width: 300px; margin-right: 10px; }\n");
+            html.append("        .filter-button { padding: 5px 10px; margin-right: 5px; cursor: pointer; }\n");
+            html.append("    </style>\n");
+            html.append("    <script>\n");
+            html.append("        function filterTable() {\n");
+            html.append("            var input = document.getElementById('searchInput').value.toLowerCase();\n");
+            html.append("            var statusFilter = document.querySelector('input[name=\"statusFilter\"]:checked').value;\n");
+            html.append("            var rows = document.querySelectorAll('table tbody tr');\n");
+            html.append("            \n");
+            html.append("            rows.forEach(function(row) {\n");
+            html.append("                var text = row.textContent.toLowerCase();\n");
+            html.append("                var status = row.className;\n");
+            html.append("                \n");
+            html.append("                var matchesSearch = text.includes(input);\n");
+            html.append("                var matchesStatus = statusFilter === 'all' || status.includes(statusFilter);\n");
+            html.append("                \n");
+            html.append("                row.style.display = matchesSearch && matchesStatus ? '' : 'none';\n");
+            html.append("            });\n");
+            html.append("        }\n");
+            html.append("    </script>\n");
+            html.append("</head>\n");
+            html.append("<body>\n");
+            html.append("    <h1>Test Execution Report</h1>\n");
+            html.append("    <div class=\"timestamp\">Generated at: " + DATE_FORMAT.format(new Date()) + "</div>\n");
+            
+            // Summary section
+            html.append("    <h2>Summary</h2>\n");
+            html.append("    <div class=\"summary\">\n");
+            html.append("        <p><strong>Total Tests:</strong> " + (summary.passCount + summary.failCount + summary.skipCount) + "</p>\n");
+            html.append("        <p><strong>Passed:</strong> " + summary.passCount + "</p>\n");
+            html.append("        <p><strong>Failed:</strong> " + summary.failCount + "</p>\n");
+            html.append("        <p><strong>Skipped:</strong> " + summary.skipCount + "</p>\n");
+            
+            // Calculate and show total duration if valid times exist
+            if (summary.firstStartTime > 0 && summary.lastEndTime > 0) {
+                long totalDurationMillis = summary.lastEndTime - summary.firstStartTime;
+                long seconds = totalDurationMillis / 1000;
+                long minutes = seconds / 60;
+                long hours = minutes / 60;
+                seconds = seconds % 60;
+                minutes = minutes % 60;
+                
+                html.append("        <p><strong>Total Duration:</strong> " + 
+                           String.format("%02d:%02d:%02d", hours, minutes, seconds) + 
+                           " (" + totalDurationMillis + " ms)</p>\n");
+                
+                html.append("        <p><strong>Start Time:</strong> " + DATE_FORMAT.format(new Date(summary.firstStartTime)) + "</p>\n");
+                html.append("        <p><strong>End Time:</strong> " + DATE_FORMAT.format(new Date(summary.lastEndTime)) + "</p>\n");
+            }
+            
+            html.append("    </div>\n");
+            
+            // Filter controls
+            html.append("    <div class=\"filter-controls\">\n");
+            html.append("        <input type=\"text\" id=\"searchInput\" class=\"search-box\" placeholder=\"Search for tests...\" onkeyup=\"filterTable()\">\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"all\" checked onclick=\"filterTable()\"> All</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"pass\" onclick=\"filterTable()\"> Passed</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"fail\" onclick=\"filterTable()\"> Failed</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"skip\" onclick=\"filterTable()\"> Skipped</label>\n");
+            html.append("    </div>\n");
+            
+            // Results table
+            html.append("    <h2>Test Results</h2>\n");
+            html.append("    <table>\n");
+            html.append("        <thead>\n");
+            html.append("            <tr>\n");
+            html.append("                <th>Suite</th>\n");
+            html.append("                <th>Test</th>\n");
+            html.append("                <th>Status</th>\n");
+            html.append("                <th>Duration (ms)</th>\n");
+            html.append("                <th>Reason</th>\n");
+            html.append("            </tr>\n");
+            html.append("        </thead>\n");
+            html.append("        <tbody>\n");
+            
+            // Add all test results
+            for (TestResult result : allResults) {
+                String rowClass = "";
+                switch (result.status) {
+                    case "PASS": rowClass = "pass"; break;
+                    case "FAIL": rowClass = "fail"; break;
+                    case "SKIP": rowClass = "skip"; break;
+                }
+                
+                html.append("            <tr class=\"" + rowClass + "\">\n");
+                html.append("                <td>" + escapeHtml(result.suiteName) + "</td>\n");
+                html.append("                <td>" + escapeHtml(result.testName) + "</td>\n");
+                html.append("                <td>" + result.status + "</td>\n");
+                html.append("                <td>" + result.duration + "</td>\n");
+                html.append("                <td>" + escapeHtml(result.reason) + "</td>\n");
+                html.append("            </tr>\n");
+            }
+            
+            html.append("        </tbody>\n");
+            html.append("    </table>\n");
+            html.append("</body>\n");
+            html.append("</html>");
+            
+            // Write the report to disk
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(REPORT_PATH))) {
+                writer.write(html.toString());
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error generating report: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            try {
+                if (lock != null) lock.release();
+                if (raf != null) raf.close();
+            } catch (IOException e) {
+                System.err.println("Error releasing file lock: " + e.getMessage());
+            }
+        }
+    }
+    
+    private List<TestResult> loadAllTestResults() throws IOException {
+        List<TestResult> results = new ArrayList<>();
+        File resultsFile = new File(RESULTS_FILE_PATH);
+        
+        if (resultsFile.exists()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(resultsFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    TestResult result = TestResult.fromCSVLine(line);
+                    if (result != null) {
+                        results.add(result);
+                    }
+                }
+            }
+        }
+        
+        return results;
+    }
+    
+    private String getUniqueKey(ITestResult result) {
+        return result.getTestClass().getName() + "." + result.getMethod().getMethodName();
+    }
+    
+    private String escapeHtml(String input) {
+        if (input == null) {
+            return "";
+        }
+        return input.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;")
+                   .replace("\"", "&quot;")
+                   .replace("'", "&#39;");
+    }
+    
+    // Helper class to handle Pattern.quote() without using regex library
+    private static class Pattern {
+        public static String quote(String s) {
+            // Simple implementation for our specific case
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c == '\\' || c == '|' || c == '[' || c == ']' || c == '*' || c == '+' || 
+                    c == '?' || c == '{' || c == '}' || c == '(' || c == ')' || c == '^' || 
+                    c == '$' || c == '.' || c == '#') {
+                    sb.append('\\');
+                }
+                sb.append(c);
+            }
+            return sb.toString();
+        }
+    }
+}
+
+
+
+
+
+
+with json 
 
 import org.testng.IExecutionListener;
 import org.testng.ITestContext;
