@@ -1,284 +1,316 @@
+package com.test.listeners;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+
+import org.testng.IExecutionListener;
 import org.testng.ITestContext;
 import org.testng.ITestListener;
 import org.testng.ITestResult;
 
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
+public class HTMLReportListener implements ITestListener, IExecutionListener {
 
-public class SmokeTestHtmlReporter implements ITestListener {
-    // Use an absolute path in the user's home directory
-    private static final String REPORT_FILE = System.getProperty("user.dir") + File.separator + "smoke_test_report.html";
-    private long startTime;
-    private long endTime;
-    private List<TestResultEntry> testResults = new ArrayList<>();
+    private static final String REPORT_PATH = "test-execution-report.html";
+    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 
-    static class TestResultEntry {
-        String className;
-        String methodName;
+    // Use thread-safe data structures
+    private static final ConcurrentHashMap<String, TestResult> testResults = new ConcurrentHashMap<>();
+    private static final AtomicInteger passCount = new AtomicInteger(0);
+    private static final AtomicInteger failCount = new AtomicInteger(0);
+    private static final AtomicInteger skipCount = new AtomicInteger(0);
+    private static final ReentrantLock reportLock = new ReentrantLock();
+
+    // Execution time tracking
+    private static volatile long suiteStartTime = 0;
+    private static volatile long suiteEndTime = 0;
+    private static boolean isFirstExecution = true;
+
+    private static class TestResult {
+        String suiteName;
+        String testName;
         String status;
-        String failureReason;
+        String reason;
         long duration;
-
-        public TestResultEntry(String className, String methodName, String status, String failureReason, long duration) {
-            this.className = className;
-            this.methodName = methodName;
+        
+        public TestResult(String suiteName, String testName, String status, String reason, long duration) {
+            this.suiteName = suiteName;
+            this.testName = testName;
             this.status = status;
-            this.failureReason = failureReason;
+            this.reason = reason;
             this.duration = duration;
         }
     }
 
     @Override
     public void onStart(ITestContext context) {
-        startTime = System.currentTimeMillis();
-        System.out.println("Starting test suite: " + context.getName());
-        System.out.println("Report will be generated at: " + REPORT_FILE);
+        // Record start time if this is the first test
+        reportLock.lock();
+        try {
+            if (isFirstExecution) {
+                suiteStartTime = System.currentTimeMillis();
+                isFirstExecution = false;
+            }
+        } finally {
+            reportLock.unlock();
+        }
     }
 
     @Override
     public void onFinish(ITestContext context) {
-        endTime = System.currentTimeMillis();
-        System.out.println("Finished test suite: " + context.getName());
+        // Update end time
+        suiteEndTime = System.currentTimeMillis();
         
-        // Generate HTML report
-        try {
-            generateHtmlReport(context.getName());
-            System.out.println("HTML Report successfully generated at: " + REPORT_FILE);
-            
-            // Verify the file was created
-            File reportFile = new File(REPORT_FILE);
-            if (reportFile.exists()) {
-                System.out.println("Report file size: " + reportFile.length() + " bytes");
-            } else {
-                System.out.println("WARNING: Report file was not found after generation attempt!");
-            }
-        } catch (IOException e) {
-            System.err.println("ERROR generating HTML report: " + e.getMessage());
-            e.printStackTrace();
-            
-            // Attempt to write to a backup location if primary fails
-            try {
-                String backupFile = System.getProperty("java.io.tmpdir") + File.separator + "smoke_test_report_backup.html";
-                System.out.println("Attempting to write report to backup location: " + backupFile);
-                generateHtmlReportToPath(context.getName(), backupFile);
-            } catch (IOException ex) {
-                System.err.println("ERROR generating backup HTML report: " + ex.getMessage());
-                ex.printStackTrace();
-            }
-        }
+        // Generate the report when the tests finish
+        generateReport();
     }
 
     @Override
     public void onTestStart(ITestResult result) {
-        System.out.println("Starting test: " + getTestName(result));
+        // We don't need to do anything here
     }
 
     @Override
     public void onTestSuccess(ITestResult result) {
+        String suiteName = result.getTestContext().getSuite().getName();
+        String testName = result.getMethod().getMethodName();
         long duration = result.getEndMillis() - result.getStartMillis();
-        testResults.add(new TestResultEntry(
-            result.getTestClass().getName(), 
-            result.getMethod().getMethodName(),
-            "PASS",
-            "",
-            duration
-        ));
-        System.out.println("Test PASSED: " + getTestName(result));
+        
+        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "PASS", "", duration));
+        passCount.incrementAndGet();
     }
 
     @Override
     public void onTestFailure(ITestResult result) {
+        String suiteName = result.getTestContext().getSuite().getName();
+        String testName = result.getMethod().getMethodName();
+        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Unknown failure";
         long duration = result.getEndMillis() - result.getStartMillis();
-        String failureReason = result.getThrowable() != null ? 
-            result.getThrowable().getMessage() : "Unknown failure";
-            
-        testResults.add(new TestResultEntry(
-            result.getTestClass().getName(), 
-            result.getMethod().getMethodName(),
-            "FAIL",
-            failureReason,
-            duration
-        ));
-        System.out.println("Test FAILED: " + getTestName(result));
-        if (result.getThrowable() != null) {
-            System.out.println("Failure reason: " + result.getThrowable().getMessage());
-        }
+        
+        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "FAIL", reason, duration));
+        failCount.incrementAndGet();
     }
 
     @Override
     public void onTestSkipped(ITestResult result) {
-        long duration = result.getEndMillis() - result.getStartMillis();
-        String skipReason = result.getThrowable() != null ? 
-            result.getThrowable().getMessage() : "Test skipped";
-            
-        testResults.add(new TestResultEntry(
-            result.getTestClass().getName(), 
-            result.getMethod().getMethodName(),
-            "SKIP",
-            skipReason,
-            duration
-        ));
-        System.out.println("Test SKIPPED: " + getTestName(result));
+        String suiteName = result.getTestContext().getSuite().getName();
+        String testName = result.getMethod().getMethodName();
+        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Test skipped";
+        long duration = 0;
+        
+        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "SKIP", reason, duration));
+        skipCount.incrementAndGet();
     }
 
     @Override
-    public void onTestFailedButWithinSuccessPercentage(ITestResult result) {
-        onTestFailure(result);
-    }
-
-    private String getTestName(ITestResult result) {
-        return result.getTestClass().getName() + "." + result.getMethod().getMethodName();
-    }
-
-    private void generateHtmlReport(String suiteName) throws IOException {
-        generateHtmlReportToPath(suiteName, REPORT_FILE);
-    }
-    
-    private void generateHtmlReportToPath(String suiteName, String filePath) throws IOException {
-        File reportFile = new File(filePath);
-        
-        // Create parent directories if they don't exist
-        File parentDir = reportFile.getParentFile();
-        if (parentDir != null && !parentDir.exists()) {
-            boolean dirCreated = parentDir.mkdirs();
-            if (!dirCreated) {
-                System.err.println("WARNING: Could not create directory: " + parentDir.getAbsolutePath());
+    public void onExecutionStart() {
+        // If first time through, set initial start time
+        reportLock.lock();
+        try {
+            if (suiteStartTime == 0) {
+                suiteStartTime = System.currentTimeMillis();
             }
-        }
-        
-        System.out.println("Writing report to: " + reportFile.getAbsolutePath());
-        
-        try (FileWriter fileWriter = new FileWriter(reportFile);
-             BufferedWriter writer = new BufferedWriter(fileWriter)) {
-            writer.write(getHtmlHeader(suiteName));
-            writer.write(getResultsTable());
-            writer.write(getHtmlFooter());
-            writer.flush();
+        } finally {
+            reportLock.unlock();
         }
     }
 
-    private String getHtmlHeader(String suiteName) {
-        long totalDuration = endTime - startTime;
-        String durationStr = formatDuration(totalDuration);
-        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-        String runDate = dateFormat.format(new Date(startTime));
+    @Override
+    public void onExecutionFinish() {
+        // Set final end time
+        suiteEndTime = System.currentTimeMillis();
         
-        int totalTests = testResults.size();
-        int passed = (int) testResults.stream().filter(r -> "PASS".equals(r.status)).count();
-        int failed = (int) testResults.stream().filter(r -> "FAIL".equals(r.status)).count();
-        int skipped = (int) testResults.stream().filter(r -> "SKIP".equals(r.status)).count();
-        
-        StringBuilder html = new StringBuilder();
-        html.append("<!DOCTYPE html>\n");
-        html.append("<html lang=\"en\">\n");
-        html.append("<head>\n");
-        html.append("    <meta charset=\"UTF-8\">\n");
-        html.append("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
-        html.append("    <title>Smoke Test Results</title>\n");
-        html.append("    <style>\n");
-        html.append("        body { font-family: Arial, sans-serif; margin: 20px; }\n");
-        html.append("        h1 { color: #333; }\n");
-        html.append("        .summary { background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }\n");
-        html.append("        .pass { background-color: #dff0d8; color: #3c763d; }\n");
-        html.append("        .fail { background-color: #f2dede; color: #a94442; }\n");
-        html.append("        .skip { background-color: #fcf8e3; color: #8a6d3b; }\n");
-        html.append("        table { width: 100%; border-collapse: collapse; margin-top: 20px; }\n");
-        html.append("        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }\n");
-        html.append("        th { background-color: #4CAF50; color: white; }\n");
-        html.append("        tr:hover { background-color: #f5f5f5; }\n");
-        html.append("        .result-pass { color: green; font-weight: bold; }\n");
-        html.append("        .result-fail { color: red; font-weight: bold; }\n");
-        html.append("        .result-skip { color: orange; font-weight: bold; }\n");
-        html.append("        .reason { max-width: 400px; overflow-wrap: break-word; }\n");
-        html.append("    </style>\n");
-        html.append("</head>\n");
-        html.append("<body>\n");
-        html.append("    <h1>Smoke Test Results</h1>\n");
-        html.append("    <div class=\"summary\">\n");
-        html.append("        <h2>Test Suite: ").append(suiteName).append("</h2>\n");
-        html.append("        <p><strong>Run Date:</strong> ").append(runDate).append("</p>\n");
-        html.append("        <p><strong>Total Duration:</strong> ").append(durationStr).append("</p>\n");
-        html.append("        <p><strong>Total Tests:</strong> ").append(totalTests).append("</p>\n");
-        html.append("        <p class=\"result-pass\"><strong>Passed:</strong> ").append(passed).append("</p>\n");
-        html.append("        <p class=\"result-fail\"><strong>Failed:</strong> ").append(failed).append("</p>\n");
-        html.append("        <p class=\"result-skip\"><strong>Skipped:</strong> ").append(skipped).append("</p>\n");
-        html.append("    </div>\n");
-        
-        return html.toString();
+        // Generate the report when all executions finish
+        generateReport();
     }
-    
-    private String getResultsTable() {
-        StringBuilder html = new StringBuilder();
-        html.append("    <h2>Test Results</h2>\n");
-        html.append("    <table>\n");
-        html.append("        <thead>\n");
-        html.append("            <tr>\n");
-        html.append("                <th>Class Name</th>\n");
-        html.append("                <th>Method Name</th>\n");
-        html.append("                <th>Status</th>\n");
-        html.append("                <th>Duration (ms)</th>\n");
-        html.append("                <th>Failure Reason</th>\n");
-        html.append("            </tr>\n");
-        html.append("        </thead>\n");
-        html.append("        <tbody>\n");
-        
-        for (TestResultEntry result : testResults) {
-            String rowClass = "";
-            String statusClass = "";
-            
-            switch (result.status) {
-                case "PASS":
-                    rowClass = "pass";
-                    statusClass = "result-pass";
-                    break;
-                case "FAIL":
-                    rowClass = "fail";
-                    statusClass = "result-fail";
-                    break;
-                case "SKIP":
-                    rowClass = "skip";
-                    statusClass = "result-skip";
-                    break;
+
+    private void generateReport() {
+        reportLock.lock();
+        try {
+            // Check if an existing report exists and load any previous results
+            File reportFile = new File(REPORT_PATH);
+            if (reportFile.exists()) {
+                loadExistingReport(reportFile);
             }
             
-            html.append("            <tr class=\"").append(rowClass).append("\">\n");
-            html.append("                <td>").append(result.className).append("</td>\n");
-            html.append("                <td>").append(result.methodName).append("</td>\n");
-            html.append("                <td class=\"").append(statusClass).append("\">").append(result.status).append("</td>\n");
-            html.append("                <td>").append(result.duration).append("</td>\n");
-            html.append("                <td class=\"reason\">").append(escapeHtml(result.failureReason)).append("</td>\n");
+            // Create or update the report
+            StringBuilder html = new StringBuilder();
+            html.append("<!DOCTYPE html>\n");
+            html.append("<html lang=\"en\">\n");
+            html.append("<head>\n");
+            html.append("    <meta charset=\"UTF-8\">\n");
+            html.append("    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+            html.append("    <title>Test Execution Report</title>\n");
+            html.append("    <style>\n");
+            html.append("        body { font-family: Arial, sans-serif; margin: 20px; }\n");
+            html.append("        .summary { background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }\n");
+            html.append("        table { width: 100%; border-collapse: collapse; }\n");
+            html.append("        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }\n");
+            html.append("        th { background-color: #f2f2f2; }\n");
+            html.append("        .pass { background-color: #dff0d8; color: #3c763d; }\n");
+            html.append("        .fail { background-color: #f2dede; color: #a94442; }\n");
+            html.append("        .skip { background-color: #fcf8e3; color: #8a6d3b; }\n");
+            html.append("        .timestamp { font-size: 12px; color: #777; margin-top: 5px; }\n");
+            html.append("    </style>\n");
+            html.append("</head>\n");
+            html.append("<body>\n");
+            html.append("    <h1>Test Execution Report</h1>\n");
+            html.append("    <div class=\"timestamp\">Generated at: " + DATE_FORMAT.format(new Date()) + "</div>\n");
+            
+            // Summary section
+            html.append("    <h2>Summary</h2>\n");
+            html.append("    <div class=\"summary\">\n");
+            html.append("        <p><strong>Total Tests:</strong> " + (passCount.get() + failCount.get() + skipCount.get()) + "</p>\n");
+            html.append("        <p><strong>Passed:</strong> " + passCount.get() + "</p>\n");
+            html.append("        <p><strong>Failed:</strong> " + failCount.get() + "</p>\n");
+            html.append("        <p><strong>Skipped:</strong> " + skipCount.get() + "</p>\n");
+            
+            // Only calculate duration if we have valid start and end times
+            if (suiteStartTime > 0 && suiteEndTime > 0) {
+                long totalDurationMillis = suiteEndTime - suiteStartTime;
+                long seconds = totalDurationMillis / 1000;
+                long minutes = seconds / 60;
+                long hours = minutes / 60;
+                seconds = seconds % 60;
+                minutes = minutes % 60;
+                
+                html.append("        <p><strong>Total Duration:</strong> " + 
+                           String.format("%02d:%02d:%02d", hours, minutes, seconds) + 
+                           " (" + totalDurationMillis + " ms)</p>\n");
+                
+                html.append("        <p><strong>Start Time:</strong> " + DATE_FORMAT.format(new Date(suiteStartTime)) + "</p>\n");
+                html.append("        <p><strong>End Time:</strong> " + DATE_FORMAT.format(new Date(suiteEndTime)) + "</p>\n");
+            }
+            
+            html.append("    </div>\n");
+            
+            // Results table
+            html.append("    <h2>Test Results</h2>\n");
+            html.append("    <table>\n");
+            html.append("        <thead>\n");
+            html.append("            <tr>\n");
+            html.append("                <th>Suite</th>\n");
+            html.append("                <th>Test</th>\n");
+            html.append("                <th>Status</th>\n");
+            html.append("                <th>Duration (ms)</th>\n");
+            html.append("                <th>Reason</th>\n");
             html.append("            </tr>\n");
+            html.append("        </thead>\n");
+            html.append("        <tbody>\n");
+            
+            // Add all test results
+            for (TestResult result : testResults.values()) {
+                String rowClass = "";
+                switch (result.status) {
+                    case "PASS": rowClass = "pass"; break;
+                    case "FAIL": rowClass = "fail"; break;
+                    case "SKIP": rowClass = "skip"; break;
+                }
+                
+                html.append("            <tr class=\"" + rowClass + "\">\n");
+                html.append("                <td>" + escapeHtml(result.suiteName) + "</td>\n");
+                html.append("                <td>" + escapeHtml(result.testName) + "</td>\n");
+                html.append("                <td>" + result.status + "</td>\n");
+                html.append("                <td>" + result.duration + "</td>\n");
+                html.append("                <td>" + escapeHtml(result.reason) + "</td>\n");
+                html.append("            </tr>\n");
+            }
+            
+            html.append("        </tbody>\n");
+            html.append("    </table>\n");
+            html.append("</body>\n");
+            html.append("</html>");
+            
+            // Write the report to disk
+            try (FileWriter writer = new FileWriter(REPORT_PATH)) {
+                writer.write(html.toString());
+            } catch (IOException e) {
+                System.err.println("Error writing report: " + e.getMessage());
+            }
+        } finally {
+            reportLock.unlock();
+        }
+    }
+    
+    private void loadExistingReport(File reportFile) {
+        try {
+            // This is a very simple parser to extract existing test counts
+            // In a full implementation, you might want a more robust HTML parser
+            String content = new String(Files.readAllBytes(Paths.get(reportFile.getPath())));
+            
+            // Extract existing counts if they exist
+            Map<String, Integer> existingCounts = extractCounts(content);
+            if (existingCounts.containsKey("passed")) {
+                passCount.addAndGet(existingCounts.get("passed"));
+            }
+            if (existingCounts.containsKey("failed")) {
+                failCount.addAndGet(existingCounts.get("failed"));
+            }
+            if (existingCounts.containsKey("skipped")) {
+                skipCount.addAndGet(existingCounts.get("skipped"));
+            }
+            
+            // We would also extract and merge the test results here in a full implementation
+            // but for simplicity, we're just extracting the counts
+            
+        } catch (IOException e) {
+            System.err.println("Error reading existing report: " + e.getMessage());
+        }
+    }
+    
+    private Map<String, Integer> extractCounts(String content) {
+        Map<String, Integer> counts = new HashMap<>();
+        
+        // Very simple extraction, would need to be more robust in a real implementation
+        try {
+            String passedPattern = "<p><strong>Passed:</strong> ";
+            String failedPattern = "<p><strong>Failed:</strong> ";
+            String skippedPattern = "<p><strong>Skipped:</strong> ";
+            
+            int passedStart = content.indexOf(passedPattern);
+            if (passedStart > 0) {
+                passedStart += passedPattern.length();
+                int passedEnd = content.indexOf("</p>", passedStart);
+                counts.put("passed", Integer.parseInt(content.substring(passedStart, passedEnd).trim()));
+            }
+            
+            int failedStart = content.indexOf(failedPattern);
+            if (failedStart > 0) {
+                failedStart += failedPattern.length();
+                int failedEnd = content.indexOf("</p>", failedStart);
+                counts.put("failed", Integer.parseInt(content.substring(failedStart, failedEnd).trim()));
+            }
+            
+            int skippedStart = content.indexOf(skippedPattern);
+            if (skippedStart > 0) {
+                skippedStart += skippedPattern.length();
+                int skippedEnd = content.indexOf("</p>", skippedStart);
+                counts.put("skipped", Integer.parseInt(content.substring(skippedStart, skippedEnd).trim()));
+            }
+        } catch (Exception e) {
+            System.err.println("Error extracting counts: " + e.getMessage());
         }
         
-        html.append("        </tbody>\n");
-        html.append("    </table>\n");
-        
-        return html.toString();
+        return counts;
     }
     
-    private String getHtmlFooter() {
-        return "</body>\n</html>";
-    }
-    
-    private String formatDuration(long millis) {
-        long minutes = TimeUnit.MILLISECONDS.toMinutes(millis);
-        long seconds = TimeUnit.MILLISECONDS.toSeconds(millis) - 
-                       TimeUnit.MINUTES.toSeconds(minutes);
-        long ms = millis - TimeUnit.MINUTES.toMillis(minutes) - 
-                  TimeUnit.SECONDS.toMillis(seconds);
-                  
-        return String.format("%d min, %d sec, %d ms", minutes, seconds, ms);
+    private String getUniqueKey(ITestResult result) {
+        return result.getTestClass().getName() + "." + result.getMethod().getMethodName();
     }
     
     private String escapeHtml(String input) {
-        if (input == null) return "";
+        if (input == null) {
+            return "";
+        }
         return input.replace("&", "&amp;")
                    .replace("<", "&lt;")
                    .replace(">", "&gt;")
@@ -286,33 +318,3 @@ public class SmokeTestHtmlReporter implements ITestListener {
                    .replace("'", "&#39;");
     }
 }
-
-
-
-
-# Force a small delay to ensure file system operations complete
-sleep 2
-
-# First check if the report was generated in the current directory
-if [ -f "$TEST_REPORT" ]; then
-    echo "Test report generated successfully at $(pwd)/$TEST_REPORT"
-    REPORT_PATH="$TEST_REPORT"
-else
-    # Try to find the report file anywhere in the project directory
-    REPORT_PATH=$(find $(pwd) -name "$TEST_REPORT" -type f | head -1)
-    
-    if [ -n "$REPORT_PATH" ]; then
-        echo "Found test report at: $REPORT_PATH"
-    else
-        echo "WARNING: Test report not found in current directory."
-        # Check temp directory for backup report
-        BACKUP_REPORT="/tmp/smoke_test_report_backup.html"
-        if [ -f "$BACKUP_REPORT" ]; then
-            echo "Found backup report at: $BACKUP_REPORT"
-            REPORT_PATH="$BACKUP_REPORT"
-        else
-            echo "ERROR: No test report found!"
-            exit 1
-        fi
-    fi
-fi
