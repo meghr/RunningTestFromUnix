@@ -1,171 +1,155 @@
-package com.test.listeners;
+#!/bin/bash
+TESTNG_JAR="path/to/testng.jar"
+LISTENER_DIR="path/to/listener/directory"
 
-import org.testng.IExecutionListener;
+for xml_file in *.xml; do
+    mvn test -Dtestng.dtd.http=false \
+             -Dsurefire.suiteXmlFiles="$xml_file" \
+             -Dmaven.test.failure.ignore=true \
+             -DargLine="-cp $TESTNG_JAR:$LISTENER_DIR"
+done
+
+
+import org.testng.ISuite;
+import org.testng.ISuiteListener;
 import org.testng.ITestContext;
 import org.testng.ITestListener;
 import org.testng.ITestResult;
-
-import java.io.*;
-import java.nio.channels.FileLock;
-import java.text.SimpleDateFormat;
-import java.util.*;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Pattern;
+import java.util.concurrent.locks.ReentrantLock;
 
-public class HTMLReportListener implements ITestListener, IExecutionListener {
+public class CustomTestListener implements ITestListener, ISuiteListener {
+    private static final String REPORT_FILE = "test_report.html";
+    private static final ReentrantLock lock = new ReentrantLock();
+    private static LocalDateTime firstTestStartTime;
+    private static LocalDateTime lastTestStartTime;
+    private static final Map<String, StringBuilder> suiteResults = new ConcurrentHashMap<>();
+    private static final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    private static final String RESULTS_FILE_PATH = "test-results.txt";
-    private static final String REPORT_PATH = "test-execution-report.html";
-    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
-    private static final String DELIMITER = "|||";
+    @Override
+    public void onStart(ISuite suite) {
+        // Initialize suite-specific buffer
+        suiteResults.putIfAbsent(suite.getName(), new StringBuilder());
+    }
 
-    private final ConcurrentHashMap<String, TestResult> currentResults = new ConcurrentHashMap<>();
-    private final AtomicInteger currentPassCount = new AtomicInteger(0);
-    private final AtomicInteger currentFailCount = new AtomicInteger(0);
-    private final AtomicInteger currentSkipCount = new AtomicInteger(0);
-    
-    private String currentSuiteName = "";
-    private long suiteStartTime;
-    
-    private static class TestResult {
-        String suiteName;
-        String testName;
-        String status;
-        String reason;
-        long duration;
+    @Override
+    public void onFinish(ISuite suite) {
+        writeReport();
+    }
 
-        public TestResult(String suiteName, String testName, String status, String reason, long duration) {
-            this.suiteName = suiteName;
-            this.testName = testName;
-            this.status = status;
-            this.reason = reason != null ? reason : "";
-            this.duration = duration;
-        }
-
-        public String toCSVLine() {
-            return suiteName + DELIMITER + testName + DELIMITER + status + DELIMITER + escapeDelimiters(reason) + DELIMITER + duration;
-        }
-
-        private String escapeDelimiters(String input) {
-            return input == null ? "" : input.replace(DELIMITER, "[DELIM]");
-        }
-
-        public static TestResult fromCSVLine(String line) {
-            String[] parts = line.split(Pattern.quote(DELIMITER), -1);
-            if (parts.length >= 5) {
-                return new TestResult(parts[0], parts[1], parts[2], parts[3].replace("[DELIM]", DELIMITER), Long.parseLong(parts[4]));
+    @Override
+    public void onTestStart(ITestResult result) {
+        LocalDateTime now = LocalDateTime.now();
+        lock.lock();
+        try {
+            if (firstTestStartTime == null) {
+                firstTestStartTime = now;
             }
-            return null;
+            lastTestStartTime = now;
+        } finally {
+            lock.unlock();
         }
-    }
-
-    @Override
-    public void onStart(ITestContext context) {
-        suiteStartTime = System.currentTimeMillis();
-        currentSuiteName = context.getSuite().getName();
-        ensureFileExists(RESULTS_FILE_PATH);
-    }
-
-    @Override
-    public void onFinish(ITestContext context) {
-        persistCurrentExecutionData();
-        generateReport();
     }
 
     @Override
     public void onTestSuccess(ITestResult result) {
-        recordTestResult(result, "PASS", "");
+        appendTestResult(result, "PASSED");
     }
 
     @Override
     public void onTestFailure(ITestResult result) {
-        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Unknown failure";
-        recordTestResult(result, "FAIL", reason);
+        appendTestResult(result, "FAILED");
     }
 
     @Override
     public void onTestSkipped(ITestResult result) {
-        String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Test skipped";
-        recordTestResult(result, "SKIP", reason);
+        appendTestResult(result, "SKIPPED");
     }
 
-    private void recordTestResult(ITestResult result, String status, String reason) {
-        String testName = result.getMethod().getMethodName();
-        long duration = result.getEndMillis() - result.getStartMillis();
+    private void appendTestResult(ITestResult result, String status) {
+        String suiteName = result.getTestContext().getSuite().getName();
+        StringBuilder sb = suiteResults.get(suiteName);
         
-        currentResults.put(testName, new TestResult(currentSuiteName, testName, status, reason, duration));
+        long duration = result.getEndMillis() - result.getStartMillis();
+        String failureReason = status.equals("FAILED") ? 
+            (result.getThrowable() != null ? result.getThrowable().getMessage() : "Unknown error") : "";
 
-        switch (status) {
-            case "PASS": currentPassCount.incrementAndGet(); break;
-            case "FAIL": currentFailCount.incrementAndGet(); break;
-            case "SKIP": currentSkipCount.incrementAndGet(); break;
+        lock.lock();
+        try {
+            sb.append("<tr>")
+                .append("<td>").append(suiteName).append("</td>")
+                .append("<td>").append(result.getMethod().getMethodName()).append("</td>")
+                .append("<td>").append(status).append("</td>")
+                .append("<td>").append(failureReason).append("</td>")
+                .append("<td>").append(duration).append(" ms</td>")
+                .append("</tr>");
+        } finally {
+            lock.unlock();
         }
     }
 
-    private void persistCurrentExecutionData() {
-        synchronized (this) {
-            try (BufferedWriter writer = new BufferedWriter(new FileWriter(RESULTS_FILE_PATH, true))) {
-                for (TestResult result : currentResults.values()) {
-                    writer.write(result.toCSVLine());
-                    writer.newLine();
-                }
-            } catch (IOException e) {
-                System.err.println("Error saving test results: " + e.getMessage());
+    private void writeReport() {
+        lock.lock();
+        try {
+            StringBuilder html = new StringBuilder();
+            html.append("<!DOCTYPE html><html><head>")
+                .append("<style>table {border-collapse: collapse; width: 100%;}")
+                .append("th, td {border: 1px solid black; padding: 8px; text-align: left;}")
+                .append("th {background-color: #f2f2f2;}</style>")
+                .append("</head><body>");
+
+            // Section 1: Summary
+            html.append("<h2>Test Execution Summary</h2>")
+                .append("<p>First Test Start Time: ").append(firstTestStartTime.format(formatter)).append("</p>")
+                .append("<p>Last Test Start Time: ").append(lastTestStartTime.format(formatter)).append("</p>")
+                .append("<p>Total Duration: ")
+                .append(java.time.Duration.between(firstTestStartTime, lastTestStartTime).toMillis())
+                .append(" ms</p>");
+
+            // Section 2: Detailed Results
+            html.append("<h2>Detailed Test Results</h2>")
+                .append("<table>")
+                .append("<tr><th>Suite Name</th><th>Test Method</th><th>Status</th><th>Failure Reason</th><th>Duration</th></tr>");
+
+            for (StringBuilder suiteResult : suiteResults.values()) {
+                html.append(suiteResult);
             }
-        }
-    }
 
-    private void generateReport() {
-        List<TestResult> allResults = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new FileReader(RESULTS_FILE_PATH))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                TestResult result = TestResult.fromCSVLine(line);
-                if (result != null) {
-                    allResults.add(result);
+            html.append("</table></body></html>");
+
+            // Append to existing file or create new
+            try (FileWriter writer = new FileWriter(REPORT_FILE, true)) {
+                if (Files.size(Paths.get(REPORT_FILE)) == 0) {
+                    writer.write(html.toString());
+                } else {
+                    // Append only the table rows if file exists
+                    for (StringBuilder suiteResult : suiteResults.values()) {
+                        writer.write(suiteResult.toString());
+                    }
                 }
             }
         } catch (IOException e) {
-            System.err.println("Error reading test results: " + e.getMessage());
-        }
-
-        StringBuilder html = new StringBuilder();
-        html.append("<html><head><title>Test Execution Report</title></head><body>");
-        html.append("<h1>Test Execution Report</h1>");
-        html.append("<table border='1'><tr><th>Suite</th><th>Test</th><th>Status</th><th>Duration (ms)</th><th>Reason</th></tr>");
-
-        for (TestResult result : allResults) {
-            String color = result.status.equals("PASS") ? "green" : (result.status.equals("FAIL") ? "red" : "orange");
-            html.append("<tr style='color:").append(color).append("'><td>")
-                .append(result.suiteName).append("</td><td>")
-                .append(result.testName).append("</td><td>")
-                .append(result.status).append("</td><td>")
-                .append(result.duration).append("</td><td>")
-                .append(result.reason).append("</td></tr>");
-        }
-
-        html.append("</table></body></html>");
-
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(REPORT_PATH))) {
-            writer.write(html.toString());
-        } catch (IOException e) {
-            System.err.println("Error writing report: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            lock.unlock();
         }
     }
-
-    private void ensureFileExists(String filePath) {
-        File file = new File(filePath);
-        if (!file.exists()) {
-            try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
-                writer.write("");
-            } catch (IOException e) {
-                System.err.println("Error creating file: " + filePath);
-            }
-        }
-    }
-
-    @Override public void onExecutionStart() {}
-    @Override public void onExecutionFinish() {}
-    @Override public void onTestStart(ITestResult result) {}
 }
+
+javac -cp "path/to/testng.jar" CustomTestListener.java
+
+
+<!DOCTYPE suite SYSTEM "http://testng.org/testng-1.0.dtd">
+<suite name="TestSuite" parallel="tests" thread-count="10">
+    <listeners>
+        <listener class-name="CustomTestListener"/>
+    </listeners>
+    <!-- Your test classes -->
+</suite>
