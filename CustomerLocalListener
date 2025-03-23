@@ -1,39 +1,47 @@
-package com.test.listeners;
-
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 
 import org.testng.IExecutionListener;
 import org.testng.ITestContext;
 import org.testng.ITestListener;
 import org.testng.ITestResult;
 
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
+
 public class HTMLReportListener implements ITestListener, IExecutionListener {
 
+    // File paths for persistence
+    private static final String RESULTS_JSON_PATH = "test-results.json";
+    private static final String SUMMARY_JSON_PATH = "test-summary.json";
     private static final String REPORT_PATH = "test-execution-report.html";
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 
-    // Use thread-safe data structures
-    private static final ConcurrentHashMap<String, TestResult> testResults = new ConcurrentHashMap<>();
-    private static final AtomicInteger passCount = new AtomicInteger(0);
-    private static final AtomicInteger failCount = new AtomicInteger(0);
-    private static final AtomicInteger skipCount = new AtomicInteger(0);
-    private static final ReentrantLock reportLock = new ReentrantLock();
-
-    // Execution time tracking
-    private static volatile long suiteStartTime = 0;
-    private static volatile long suiteEndTime = 0;
-    private static boolean isFirstExecution = true;
+    // Current execution tracking
+    private final ConcurrentHashMap<String, TestResult> currentResults = new ConcurrentHashMap<>();
+    private final AtomicInteger currentPassCount = new AtomicInteger(0);
+    private final AtomicInteger currentFailCount = new AtomicInteger(0);
+    private final AtomicInteger currentSkipCount = new AtomicInteger(0);
+    private final ReentrantLock fileLock = new ReentrantLock();
+    
+    // Execution time tracking for current execution
+    private long suiteStartTime = 0;
+    private long suiteEndTime = 0;
+    private String currentSuiteName = "";
 
     private static class TestResult {
         String suiteName;
@@ -49,100 +57,221 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
             this.reason = reason;
             this.duration = duration;
         }
+        
+        public JSONObject toJSON() {
+            JSONObject json = new JSONObject();
+            json.put("suiteName", suiteName);
+            json.put("testName", testName);
+            json.put("status", status);
+            json.put("reason", reason);
+            json.put("duration", duration);
+            return json;
+        }
+        
+        public static TestResult fromJSON(JSONObject json) {
+            return new TestResult(
+                (String) json.get("suiteName"),
+                (String) json.get("testName"),
+                (String) json.get("status"),
+                (String) json.get("reason"),
+                (Long) json.get("duration")
+            );
+        }
     }
 
     @Override
     public void onStart(ITestContext context) {
-        // Record start time if this is the first test
-        reportLock.lock();
+        suiteStartTime = System.currentTimeMillis();
+        currentSuiteName = context.getSuite().getName();
+        
+        // Initialize existing summary if first time
+        fileLock.lock();
         try {
-            if (isFirstExecution) {
-                suiteStartTime = System.currentTimeMillis();
-                isFirstExecution = false;
+            File summaryFile = new File(SUMMARY_JSON_PATH);
+            if (!summaryFile.exists()) {
+                createInitialSummaryFile();
             }
+        } catch (Exception e) {
+            System.err.println("Error initializing summary file: " + e.getMessage());
         } finally {
-            reportLock.unlock();
+            fileLock.unlock();
         }
     }
 
     @Override
     public void onFinish(ITestContext context) {
-        // Update end time
         suiteEndTime = System.currentTimeMillis();
         
-        // Generate the report when the tests finish
+        // Save current execution results
+        persistCurrentExecutionData();
+        
+        // Generate consolidated report
         generateReport();
-    }
-
-    @Override
-    public void onTestStart(ITestResult result) {
-        // We don't need to do anything here
     }
 
     @Override
     public void onTestSuccess(ITestResult result) {
-        String suiteName = result.getTestContext().getSuite().getName();
         String testName = result.getMethod().getMethodName();
         long duration = result.getEndMillis() - result.getStartMillis();
         
-        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "PASS", "", duration));
-        passCount.incrementAndGet();
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "PASS", "", duration));
+        currentPassCount.incrementAndGet();
     }
 
     @Override
     public void onTestFailure(ITestResult result) {
-        String suiteName = result.getTestContext().getSuite().getName();
         String testName = result.getMethod().getMethodName();
         String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Unknown failure";
         long duration = result.getEndMillis() - result.getStartMillis();
         
-        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "FAIL", reason, duration));
-        failCount.incrementAndGet();
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "FAIL", reason, duration));
+        currentFailCount.incrementAndGet();
     }
 
     @Override
     public void onTestSkipped(ITestResult result) {
-        String suiteName = result.getTestContext().getSuite().getName();
         String testName = result.getMethod().getMethodName();
         String reason = result.getThrowable() != null ? result.getThrowable().getMessage() : "Test skipped";
-        long duration = 0;
         
-        testResults.put(getUniqueKey(result), new TestResult(suiteName, testName, "SKIP", reason, duration));
-        skipCount.incrementAndGet();
+        currentResults.put(getUniqueKey(result), 
+            new TestResult(currentSuiteName, testName, "SKIP", reason, 0));
+        currentSkipCount.incrementAndGet();
     }
 
     @Override
     public void onExecutionStart() {
-        // If first time through, set initial start time
-        reportLock.lock();
-        try {
-            if (suiteStartTime == 0) {
-                suiteStartTime = System.currentTimeMillis();
-            }
-        } finally {
-            reportLock.unlock();
-        }
+        // Not using this for cross-JVM as onStart is more reliable
     }
 
     @Override
     public void onExecutionFinish() {
-        // Set final end time
-        suiteEndTime = System.currentTimeMillis();
+        // Make sure all results are saved
+        persistCurrentExecutionData();
+    }
+    
+    @Override
+    public void onTestStart(ITestResult result) {
+        // Not needed for this implementation
+    }
+
+    private void persistCurrentExecutionData() {
+        fileLock.lock();
+        try {
+            // 1. Save test results to JSON file
+            saveCurrentTestResults();
+            
+            // 2. Update summary with current execution
+            updateSummary();
+            
+        } catch (Exception e) {
+            System.err.println("Error persisting execution data: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            fileLock.unlock();
+        }
+    }
+    
+    private void saveCurrentTestResults() throws Exception {
+        // Convert current results to JSON
+        JSONArray jsonResults = new JSONArray();
+        for (TestResult result : currentResults.values()) {
+            jsonResults.add(result.toJSON());
+        }
         
-        // Generate the report when all executions finish
-        generateReport();
+        // Load existing results if they exist
+        File resultsFile = new File(RESULTS_JSON_PATH);
+        if (resultsFile.exists()) {
+            JSONParser parser = new JSONParser();
+            try (FileReader reader = new FileReader(resultsFile)) {
+                JSONArray existingResults = (JSONArray) parser.parse(reader);
+                // Add existing results
+                for (Object obj : existingResults) {
+                    jsonResults.add(obj);
+                }
+            }
+        }
+        
+        // Write combined results back to file
+        try (FileWriter writer = new FileWriter(RESULTS_JSON_PATH)) {
+            writer.write(jsonResults.toJSONString());
+        }
+    }
+    
+    private void updateSummary() throws Exception {
+        JSONObject summary = readSummaryFile();
+        
+        // Update counts
+        long totalPass = (Long) summary.get("passCount") + currentPassCount.get();
+        long totalFail = (Long) summary.get("failCount") + currentFailCount.get();
+        long totalSkip = (Long) summary.get("skipCount") + currentSkipCount.get();
+        
+        summary.put("passCount", totalPass);
+        summary.put("failCount", totalFail);
+        summary.put("skipCount", totalSkip);
+        
+        // Update time tracking
+        if ((Long) summary.get("firstStartTime") == 0) {
+            summary.put("firstStartTime", suiteStartTime);
+        }
+        
+        // Always update last end time
+        if (suiteEndTime > 0) {
+            summary.put("lastEndTime", suiteEndTime);
+        }
+        
+        // Write the updated summary
+        try (FileWriter writer = new FileWriter(SUMMARY_JSON_PATH)) {
+            writer.write(summary.toJSONString());
+        }
+    }
+    
+    private JSONObject readSummaryFile() throws Exception {
+        JSONParser parser = new JSONParser();
+        File summaryFile = new File(SUMMARY_JSON_PATH);
+        
+        if (summaryFile.exists()) {
+            try (FileReader reader = new FileReader(summaryFile)) {
+                return (JSONObject) parser.parse(reader);
+            }
+        } else {
+            return createInitialSummaryFile();
+        }
+    }
+    
+    private JSONObject createInitialSummaryFile() {
+        JSONObject summary = new JSONObject();
+        summary.put("passCount", 0L);
+        summary.put("failCount", 0L);
+        summary.put("skipCount", 0L);
+        summary.put("firstStartTime", 0L);
+        summary.put("lastEndTime", 0L);
+        
+        try (FileWriter writer = new FileWriter(SUMMARY_JSON_PATH)) {
+            writer.write(summary.toJSONString());
+        } catch (IOException e) {
+            System.err.println("Error creating summary file: " + e.getMessage());
+        }
+        
+        return summary;
     }
 
     private void generateReport() {
-        reportLock.lock();
+        fileLock.lock();
         try {
-            // Check if an existing report exists and load any previous results
-            File reportFile = new File(REPORT_PATH);
-            if (reportFile.exists()) {
-                loadExistingReport(reportFile);
-            }
+            // Load summary data
+            JSONObject summary = readSummaryFile();
+            long totalPass = (Long) summary.get("passCount");
+            long totalFail = (Long) summary.get("failCount");
+            long totalSkip = (Long) summary.get("skipCount");
+            long firstStartTime = (Long) summary.get("firstStartTime");
+            long lastEndTime = (Long) summary.get("lastEndTime");
             
-            // Create or update the report
+            // Load all test results
+            List<TestResult> allResults = loadAllTestResults();
+            
+            // Create HTML report
             StringBuilder html = new StringBuilder();
             html.append("<!DOCTYPE html>\n");
             html.append("<html lang=\"en\">\n");
@@ -160,7 +289,27 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
             html.append("        .fail { background-color: #f2dede; color: #a94442; }\n");
             html.append("        .skip { background-color: #fcf8e3; color: #8a6d3b; }\n");
             html.append("        .timestamp { font-size: 12px; color: #777; margin-top: 5px; }\n");
+            html.append("        .filter-controls { margin-bottom: 15px; }\n");
+            html.append("        .search-box { padding: 5px; width: 300px; margin-right: 10px; }\n");
+            html.append("        .filter-button { padding: 5px 10px; margin-right: 5px; cursor: pointer; }\n");
             html.append("    </style>\n");
+            html.append("    <script>\n");
+            html.append("        function filterTable() {\n");
+            html.append("            var input = document.getElementById('searchInput').value.toLowerCase();\n");
+            html.append("            var statusFilter = document.querySelector('input[name=\"statusFilter\"]:checked').value;\n");
+            html.append("            var rows = document.querySelectorAll('table tbody tr');\n");
+            html.append("            \n");
+            html.append("            rows.forEach(function(row) {\n");
+            html.append("                var text = row.textContent.toLowerCase();\n");
+            html.append("                var status = row.className;\n");
+            html.append("                \n");
+            html.append("                var matchesSearch = text.includes(input);\n");
+            html.append("                var matchesStatus = statusFilter === 'all' || status.includes(statusFilter);\n");
+            html.append("                \n");
+            html.append("                row.style.display = matchesSearch && matchesStatus ? '' : 'none';\n");
+            html.append("            });\n");
+            html.append("        }\n");
+            html.append("    </script>\n");
             html.append("</head>\n");
             html.append("<body>\n");
             html.append("    <h1>Test Execution Report</h1>\n");
@@ -169,14 +318,14 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
             // Summary section
             html.append("    <h2>Summary</h2>\n");
             html.append("    <div class=\"summary\">\n");
-            html.append("        <p><strong>Total Tests:</strong> " + (passCount.get() + failCount.get() + skipCount.get()) + "</p>\n");
-            html.append("        <p><strong>Passed:</strong> " + passCount.get() + "</p>\n");
-            html.append("        <p><strong>Failed:</strong> " + failCount.get() + "</p>\n");
-            html.append("        <p><strong>Skipped:</strong> " + skipCount.get() + "</p>\n");
+            html.append("        <p><strong>Total Tests:</strong> " + (totalPass + totalFail + totalSkip) + "</p>\n");
+            html.append("        <p><strong>Passed:</strong> " + totalPass + "</p>\n");
+            html.append("        <p><strong>Failed:</strong> " + totalFail + "</p>\n");
+            html.append("        <p><strong>Skipped:</strong> " + totalSkip + "</p>\n");
             
-            // Only calculate duration if we have valid start and end times
-            if (suiteStartTime > 0 && suiteEndTime > 0) {
-                long totalDurationMillis = suiteEndTime - suiteStartTime;
+            // Calculate and show total duration if valid times exist
+            if (firstStartTime > 0 && lastEndTime > 0) {
+                long totalDurationMillis = lastEndTime - firstStartTime;
                 long seconds = totalDurationMillis / 1000;
                 long minutes = seconds / 60;
                 long hours = minutes / 60;
@@ -187,10 +336,19 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
                            String.format("%02d:%02d:%02d", hours, minutes, seconds) + 
                            " (" + totalDurationMillis + " ms)</p>\n");
                 
-                html.append("        <p><strong>Start Time:</strong> " + DATE_FORMAT.format(new Date(suiteStartTime)) + "</p>\n");
-                html.append("        <p><strong>End Time:</strong> " + DATE_FORMAT.format(new Date(suiteEndTime)) + "</p>\n");
+                html.append("        <p><strong>Start Time:</strong> " + DATE_FORMAT.format(new Date(firstStartTime)) + "</p>\n");
+                html.append("        <p><strong>End Time:</strong> " + DATE_FORMAT.format(new Date(lastEndTime)) + "</p>\n");
             }
             
+            html.append("    </div>\n");
+            
+            // Filter controls
+            html.append("    <div class=\"filter-controls\">\n");
+            html.append("        <input type=\"text\" id=\"searchInput\" class=\"search-box\" placeholder=\"Search for tests...\" onkeyup=\"filterTable()\">\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"all\" checked onclick=\"filterTable()\"> All</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"pass\" onclick=\"filterTable()\"> Passed</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"fail\" onclick=\"filterTable()\"> Failed</label>\n");
+            html.append("        <label><input type=\"radio\" name=\"statusFilter\" value=\"skip\" onclick=\"filterTable()\"> Skipped</label>\n");
             html.append("    </div>\n");
             
             // Results table
@@ -208,7 +366,7 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
             html.append("        <tbody>\n");
             
             // Add all test results
-            for (TestResult result : testResults.values()) {
+            for (TestResult result : allResults) {
                 String rowClass = "";
                 switch (result.status) {
                     case "PASS": rowClass = "pass"; break;
@@ -233,74 +391,31 @@ public class HTMLReportListener implements ITestListener, IExecutionListener {
             // Write the report to disk
             try (FileWriter writer = new FileWriter(REPORT_PATH)) {
                 writer.write(html.toString());
-            } catch (IOException e) {
-                System.err.println("Error writing report: " + e.getMessage());
-            }
-        } finally {
-            reportLock.unlock();
-        }
-    }
-    
-    private void loadExistingReport(File reportFile) {
-        try {
-            // This is a very simple parser to extract existing test counts
-            // In a full implementation, you might want a more robust HTML parser
-            String content = new String(Files.readAllBytes(Paths.get(reportFile.getPath())));
-            
-            // Extract existing counts if they exist
-            Map<String, Integer> existingCounts = extractCounts(content);
-            if (existingCounts.containsKey("passed")) {
-                passCount.addAndGet(existingCounts.get("passed"));
-            }
-            if (existingCounts.containsKey("failed")) {
-                failCount.addAndGet(existingCounts.get("failed"));
-            }
-            if (existingCounts.containsKey("skipped")) {
-                skipCount.addAndGet(existingCounts.get("skipped"));
             }
             
-            // We would also extract and merge the test results here in a full implementation
-            // but for simplicity, we're just extracting the counts
-            
-        } catch (IOException e) {
-            System.err.println("Error reading existing report: " + e.getMessage());
-        }
-    }
-    
-    private Map<String, Integer> extractCounts(String content) {
-        Map<String, Integer> counts = new HashMap<>();
-        
-        // Very simple extraction, would need to be more robust in a real implementation
-        try {
-            String passedPattern = "<p><strong>Passed:</strong> ";
-            String failedPattern = "<p><strong>Failed:</strong> ";
-            String skippedPattern = "<p><strong>Skipped:</strong> ";
-            
-            int passedStart = content.indexOf(passedPattern);
-            if (passedStart > 0) {
-                passedStart += passedPattern.length();
-                int passedEnd = content.indexOf("</p>", passedStart);
-                counts.put("passed", Integer.parseInt(content.substring(passedStart, passedEnd).trim()));
-            }
-            
-            int failedStart = content.indexOf(failedPattern);
-            if (failedStart > 0) {
-                failedStart += failedPattern.length();
-                int failedEnd = content.indexOf("</p>", failedStart);
-                counts.put("failed", Integer.parseInt(content.substring(failedStart, failedEnd).trim()));
-            }
-            
-            int skippedStart = content.indexOf(skippedPattern);
-            if (skippedStart > 0) {
-                skippedStart += skippedPattern.length();
-                int skippedEnd = content.indexOf("</p>", skippedStart);
-                counts.put("skipped", Integer.parseInt(content.substring(skippedStart, skippedEnd).trim()));
-            }
         } catch (Exception e) {
-            System.err.println("Error extracting counts: " + e.getMessage());
+            System.err.println("Error generating report: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            fileLock.unlock();
+        }
+    }
+    
+    private List<TestResult> loadAllTestResults() throws Exception {
+        List<TestResult> results = new ArrayList<>();
+        File resultsFile = new File(RESULTS_JSON_PATH);
+        
+        if (resultsFile.exists()) {
+            JSONParser parser = new JSONParser();
+            try (FileReader reader = new FileReader(resultsFile)) {
+                JSONArray jsonResults = (JSONArray) parser.parse(reader);
+                for (Object obj : jsonResults) {
+                    results.add(TestResult.fromJSON((JSONObject) obj));
+                }
+            }
         }
         
-        return counts;
+        return results;
     }
     
     private String getUniqueKey(ITestResult result) {
