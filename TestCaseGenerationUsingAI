@@ -1,0 +1,366 @@
+# Using AI to Enhance Test Preparation & Automation
+
+## Introduction
+
+Welcome to our guide on leveraging AI, specifically Git Duo, to revolutionize how we understand requirements, create test cases, and identify bugs early in the testing lifecycle. This confluence page serves as both documentation and a practical tutorial for integrating AI into our testing workflow.
+
+## Table of Contents
+- [Why AI for Testing?](#why-ai-for-testing)
+- [Getting Started with Git Duo](#getting-started-with-git-duo)
+- [Prompt Engineering for Requirement Analysis](#prompt-engineering-for-requirement-analysis)
+- [Creating Effective Test Cases with AI](#creating-effective-test-cases-with-ai)
+- [Automating Test Cases Using Our Internal Framework](#automating-test-cases)
+- [Tips & Tricks for Maximum Efficiency](#tips-and-tricks)
+- [Interactive Examples](#interactive-examples)
+- [FAQ](#faq)
+
+## Why AI for Testing? {#why-ai-for-testing}
+
+AI tools like Git Duo offer several advantages for software testing:
+
+- **Rapid requirement analysis**: AI can quickly parse and understand complex requirements
+- **Comprehensive test case generation**: AI can think of edge cases humans might miss
+- **Efficient test automation**: AI can help develop automation scripts faster
+- **Consistency**: AI ensures a standardized approach to testing
+- **Early bug detection**: AI pattern recognition can identify potential issues before they become costly problems
+
+## Getting Started with Git Duo {#getting-started-with-git-duo}
+
+Git Duo is an AI-powered coding assistant that integrates directly with your development environment. To get started:
+
+1. **Access Git Duo**: Navigate to your team's Git Duo portal or install the integration
+2. **Authentication**: Log in with your company credentials
+3. **Project Context**: Connect Git Duo to your repository to provide context
+4. **Chat Interface**: Begin conversations about your testing needs
+
+> 💡 **Pro Tip**: Take time to introduce Git Duo to your codebase and testing framework by sharing documentation links or repository structure.
+
+## Prompt Engineering for Requirement Analysis {#prompt-engineering-for-requirement-analysis}
+
+Effective prompts are key to getting useful outputs from Git Duo. Here's how to craft prompts for requirement analysis:
+
+### Example Requirement:
+```
+The application should allow users to filter products by multiple categories simultaneously and sort results by price, popularity, or date added. Filter selections should be maintained when changing sort options.
+```
+
+### Effective Prompt Structure:
+
+```
+I need to analyze this requirement for testing purposes:
+[PASTE REQUIREMENT]
+
+Please:
+1. Break down all functional components
+2. Identify implicit requirements and assumptions
+3. Highlight potential edge cases
+4. List possible user scenarios that should be tested
+5. Identify integration points with other systems
+6. Flag any ambiguous aspects that need clarification
+```
+
+### Sample Git Duo Response:
+
+```
+## Requirement Analysis
+
+### Functional Components:
+- Product filtering by multiple categories simultaneously
+- Product sorting by price, popularity, and date added
+- Persistence of filter selections during sort changes
+
+### Implicit Requirements:
+- UI elements for filter selection (checkboxes, dropdowns, etc.)
+- UI elements for sort selection
+- Filter and sort operations should perform efficiently
+- Results should update dynamically
+
+### Potential Edge Cases:
+- No products match the selected filters
+- Very large number of filter selections
+- Products with identical sort values (e.g., same price)
+- Filter by all available categories (equivalent to no filter)
+
+### User Scenarios:
+- User selects multiple categories, then changes sort order
+- User removes all filter selections
+- User rapidly changes filters and sort options
+- User applies filters, leaves page, returns (session handling)
+
+### Integration Points:
+- Product database/API
+- User session management
+- Frontend state management
+
+### Ambiguities Requiring Clarification:
+- Should filters be AND or OR logic between categories?
+- Should sorting preserve previous sorting as a secondary key?
+- Are there performance requirements for filter/sort operations?
+- How should the system handle invalid filter combinations?
+```
+
+## Creating Effective Test Cases with AI {#creating-effective-test-cases-with-ai}
+
+Once requirements are analyzed, Git Duo can help generate comprehensive test cases:
+
+### Test Case Generation Prompt:
+
+```
+Based on the requirement analysis, please generate detailed test cases in our standard format:
+
+Test Case ID: [ID]
+Test Case Name: [Name]
+Objective: [Objective]
+Preconditions: [Preconditions]
+Test Steps:
+1. [Step 1]
+2. [Step 2]
+...
+Expected Results: [Expected Results]
+Test Data: [Test Data]
+Special Instructions: [Special Instructions]
+Priority: [High/Medium/Low]
+```
+
+### Sample Output:
+
+```
+Test Case ID: FILTER-SORT-001
+Test Case Name: Multiple Category Filter with Sort Change
+Objective: Verify that multiple category filter selections are maintained when changing sort options
+Preconditions: 
+- User is logged in
+- Products database has items in multiple categories
+- User is on product listing page
+
+Test Steps:
+1. Select Category Filter "Electronics"
+2. Select additional Category Filter "New Arrivals"
+3. Verify products displayed meet both category criteria
+4. Change Sort option from default to "Price: Low to High"
+5. Verify products remain filtered by both categories
+6. Verify products are now sorted by price ascending
+
+Expected Results:
+- Products displayed should belong to both "Electronics" AND "New Arrivals" categories
+- Product order should change to price ascending
+- Filter selections should remain visibly selected in the UI
+
+Test Data:
+- User credentials: testuser/password
+- Sample products in test database spanning multiple categories
+
+Special Instructions:
+- Execute on all supported browsers
+- Check mobile responsiveness
+
+Priority: High
+```
+
+## Automating Test Cases Using Our Internal Framework {#automating-test-cases}
+
+After creating test cases, Git Duo can help translate them into automation scripts for our internal framework:
+
+### Automation Script Generation Prompt:
+
+```
+Please convert this test case into an automation script using our internal framework:
+
+[PASTE TEST CASE]
+
+Our framework uses the following conventions:
+- PageObject pattern for UI elements
+- TestNG annotations for test structure
+- AssertJ for assertions
+- Framework-specific classes:
+  - TestBase for setup/teardown
+  - ProductPage for product listing functionality
+  - FilterComponent for handling filters
+  - SortComponent for handling sorting
+```
+
+### Sample Automation Script:
+
+```java
+/**
+ * Test case: FILTER-SORT-001
+ * Multiple Category Filter with Sort Change
+ */
+@Test(priority = 1, groups = {"filters", "regression"})
+public void testMultipleCategoryFilterWithSortChange() {
+    // Login and setup preconditions
+    loginPage.loginAsStandardUser("testuser", "password");
+    productListingPage.waitForPageToLoad();
+    
+    // Apply filters
+    FilterComponent filters = productListingPage.getFilters();
+    filters.selectCategory("Electronics");
+    filters.selectCategory("New Arrivals");
+    
+    // Verify products match both categories
+    List<Product> filteredProducts = productListingPage.getDisplayedProducts();
+    assertThat(filteredProducts).isNotEmpty();
+    assertThat(filteredProducts).allMatch(p -> 
+        p.getCategories().contains("Electronics") && 
+        p.getCategories().contains("New Arrivals")
+    );
+    
+    // Change sort option
+    SortComponent sorter = productListingPage.getSorter();
+    sorter.selectSortOption("Price: Low to High");
+    productListingPage.waitForProductsToReload();
+    
+    // Verify filters maintained
+    FilterComponent filtersAfterSort = productListingPage.getFilters();
+    assertThat(filtersAfterSort.isSelected("Electronics")).isTrue();
+    assertThat(filtersAfterSort.isSelected("New Arrivals")).isTrue();
+    
+    // Verify products still match both categories
+    List<Product> productsAfterSort = productListingPage.getDisplayedProducts();
+    assertThat(productsAfterSort).isNotEmpty();
+    assertThat(productsAfterSort).allMatch(p -> 
+        p.getCategories().contains("Electronics") && 
+        p.getCategories().contains("New Arrivals")
+    );
+    
+    // Verify sort order
+    assertThat(productsAfterSort).isSortedAccordingTo(
+        Comparator.comparing(Product::getPrice)
+    );
+}
+```
+
+## Tips & Tricks for Maximum Efficiency {#tips-and-tricks}
+
+### Effective Prompt Techniques
+
+1. **Be explicit about format**: Specify exactly how you want the output structured
+2. **Provide context**: Share framework details, coding standards, and existing patterns
+3. **Use step-by-step instructions**: Break complex requests into numbered steps
+4. **Request explanations**: Ask Git Duo to explain its reasoning for test cases
+5. **Iterative refinement**: Start broad, then ask for specific improvements
+
+### Workflow Integration
+
+1. **Requirements review meetings**: Use Git Duo during meetings to quickly analyze new requirements
+2. **Automated daily checks**: Set up Git Duo to review code changes and suggest tests
+3. **Testing templates**: Create a library of prompt templates for common testing scenarios
+4. **Documentation generation**: Have Git Duo generate test documentation from code
+5. **Knowledge sharing**: Use Git Duo sessions as learning opportunities for the team
+
+### Advanced Testing Strategies
+
+1. **Boundary value analysis**: Ask Git Duo to identify boundary conditions systematically
+2. **Negative testing**: Request explicit negative test cases for each requirement
+3. **Security testing**: Use prompts focusing on security vulnerabilities
+4. **Performance considerations**: Ask for performance test scenarios
+5. **Accessibility testing**: Generate test cases specifically for accessibility compliance
+
+## Interactive Examples {#interactive-examples}
+
+### Example 1: Ambiguous Requirement Analysis
+
+**Original Requirement:**
+```
+Users should be able to export reports in different formats.
+```
+
+**Interactive Session with Git Duo:**
+
+```
+You: Analyze this requirement for testing: "Users should be able to export reports in different formats."
+
+Git Duo: This requirement is quite ambiguous. I need to identify what's missing:
+
+1. Which specific formats are required? (PDF, CSV, Excel, XML, JSON?)
+2. Which reports can be exported? (All or specific ones?)
+3. Where is the export functionality located in the UI?
+4. Are there size limitations for exports?
+5. How should the system handle export failures?
+6. Are there permissions/roles that affect export capabilities?
+7. What metadata should be included in exports?
+8. Are there any compliance requirements for exported data?
+
+You: Good points. Let's assume PDF, Excel, and CSV formats for all reports, accessible via an export button on each report page.
+
+Git Duo: Thanks for the clarification. Here's a refined analysis:
+
+[Detailed analysis provided]
+
+Now let me generate initial test cases for this requirement...
+
+[Test cases provided]
+
+You: These look good, but we need to add tests for very large reports that might time out.
+
+Git Duo: Excellent point! Here are additional test cases for performance and error handling scenarios:
+
+[Additional test cases with focus on large reports and timeout handling]
+```
+
+### Example 2: Converting Manual Tests to Automation
+
+**Manual Test:**
+```
+Test: User Registration
+1. Navigate to registration page
+2. Enter valid information in all fields
+3. Click Submit
+4. Verify confirmation email is sent
+5. Click confirmation link in email
+6. Verify user can now log in
+```
+
+**Interactive Session with Git Duo:**
+
+```
+You: Help me convert this manual test to an automated test using our framework.
+
+Git Duo: I'll help you automate this test. What testing framework and libraries are you using?
+
+You: We use Selenium WebDriver with TestNG and have PageObjects for Registration and Login pages.
+
+Git Duo: Perfect. Here's the automated script:
+
+[Automation code provided]
+
+You: We also need to handle the email verification part.
+
+Git Duo: For email verification, we can use our email testing library. Here's the updated script:
+
+[Updated automation code with email verification]
+```
+
+## FAQ {#faq}
+
+**Q: How do I provide enough context to Git Duo?**
+A: Start your conversation by describing your project, testing framework, and coding standards. You can also share links to internal documentation.
+
+**Q: Can Git Duo help with API testing?**
+A: Yes! Git Duo can generate API test cases, help design test data, and even create test scripts for tools like Postman or RestAssured.
+
+**Q: How do I handle sensitive information when using Git Duo?**
+A: Never share actual credentials, customer data, or security-sensitive code. Use placeholders like `[API_KEY]` instead.
+
+**Q: Can Git Duo analyze existing test coverage?**
+A: Yes, share your current test coverage reports and codebase information, and Git Duo can help identify gaps and suggest additional test cases.
+
+**Q: How should I validate Git Duo's suggestions?**
+A: Always review generated test cases and code for accuracy. Git Duo is a tool to enhance your testing, not replace human judgment.
+
+---
+
+## Next Steps
+
+This confluence page is designed to evolve with our team's needs. Please add your own examples, tips, and insights as you experiment with Git Duo for testing.
+
+### Upcoming Workshops
+
+- **Introduction to Git Duo**: [Date/Time]
+- **Advanced Prompt Engineering for Testing**: [Date/Time]
+- **AI-Assisted Test Automation**: [Date/Time]
+
+### Feedback
+
+Share your experiences and suggestions for improving our AI-assisted testing process:
+[Link to Feedback Form]
