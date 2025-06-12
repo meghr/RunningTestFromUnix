@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+FIX Message Injector Utility
+A high-performance, scalable FIX message injection tool with rate control and response capture.
+"""
+
+import asyncio
+import json
+import logging
+import time
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor
+import csv
+import yaml
+
+
+@dataclass
+class FixConfig:
+    """Configuration for FIX connection"""
+    host: str
+    port: int
+    sender_comp_id: str
+    target_comp_id: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    heartbeat_interval: int = 30
+    logon_timeout: int = 10
+    socket_timeout: int = 5
+
+
+@dataclass
+class InjectorConfig:
+    """Configuration for message injection"""
+    input_file: str
+    output_file: str
+    message_rate: int = 100  # messages per second
+    max_concurrent: int = 10
+    batch_size: int = 100
+    response_timeout: int = 5
+    enable_logging: bool = True
+    log_level: str = "INFO"
+
+
+@dataclass
+class MessageResult:
+    """Result of a FIX message injection"""
+    sequence_number: int
+    sent_time: str
+    message: str
+    response: Optional[str] = None
+    response_time: Optional[str] = None
+    error: Optional[str] = None
+    latency_ms: Optional[float] = None
+
+
+class FixMessageParser:
+    """Parser for FIX messages"""
+    
+    @staticmethod
+    def parse_fix_message(message: str) -> Dict[str, str]:
+        """Parse a FIX message into field dictionary"""
+        fields = {}
+        parts = message.split('\x01')  # FIX field separator
+        
+        for part in parts:
+            if '=' in part:
+                tag, value = part.split('=', 1)
+                fields[tag] = value
+        
+        return fields
+    
+    @staticmethod
+    def build_fix_message(fields: Dict[str, str]) -> str:
+        """Build FIX message from field dictionary"""
+        message_parts = []
+        for tag, value in fields.items():
+            message_parts.append(f"{tag}={value}")
+        
+        return '\x01'.join(message_parts) + '\x01'
+    
+    @staticmethod
+    def calculate_checksum(message: str) -> str:
+        """Calculate FIX message checksum"""
+        checksum = sum(ord(c) for c in message) % 256
+        return f"{checksum:03d}"
+
+
+class FixConnection:
+    """Async FIX connection handler"""
+    
+    def __init__(self, config: FixConfig):
+        self.config = config
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.sequence_number = 1
+        self.target_sequence_number = 1
+        self.connected = False
+        self.parser = FixMessageParser()
+        
+    async def connect(self) -> bool:
+        """Establish FIX connection"""
+        try:
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.config.host, self.config.port),
+                timeout=self.config.socket_timeout
+            )
+            
+            # Send logon message
+            if await self._send_logon():
+                self.connected = True
+                logging.info(f"Connected to {self.config.host}:{self.config.port}")
+                return True
+            
+        except Exception as e:
+            logging.error(f"Connection failed: {e}")
+            
+        return False
+    
+    async def disconnect(self):
+        """Close FIX connection"""
+        if self.writer:
+            await self._send_logout()
+            self.writer.close()
+            await self.writer.wait_closed()
+            self.connected = False
+            logging.info("Disconnected from FIX server")
+    
+    async def _send_logon(self) -> bool:
+        """Send FIX logon message"""
+        logon_fields = {
+            '8': 'FIX.4.4',  # BeginString
+            '35': 'A',       # MsgType (Logon)
+            '49': self.config.sender_comp_id,  # SenderCompID
+            '56': self.config.target_comp_id,  # TargetCompID
+            '34': str(self.sequence_number),   # MsgSeqNum
+            '52': datetime.utcnow().strftime('%Y%m%d-%H:%M:%S.%f')[:-3],  # SendingTime
+            '98': '0',       # EncryptMethod
+            '108': str(self.config.heartbeat_interval),  # HeartBtInt
+        }
+        
+        if self.config.username:
+            logon_fields['553'] = self.config.username
+        if self.config.password:
+            logon_fields['554'] = self.config.password
+        
+        return await self._send_message(logon_fields)
+    
+    async def _send_logout(self):
+        """Send FIX logout message"""
+        logout_fields = {
+            '8': 'FIX.4.4',
+            '35': '5',  # MsgType (Logout)
+            '49': self.config.sender_comp_id,
+            '56': self.config.target_comp_id,
+            '34': str(self.sequence_number),
+            '52': datetime.utcnow().strftime('%Y%m%d-%H:%M:%S.%f')[:-3],
+        }
+        
+        await self._send_message(logout_fields)
+    
+    async def _send_message(self, fields: Dict[str, str]) -> bool:
+        """Send FIX message"""
+        try:
+            # Build message without length and checksum
+            temp_message = self.parser.build_fix_message(fields)
+            
+            # Calculate body length (excluding BeginString, BodyLength, and Checksum)
+            body_start = temp_message.find('\x01', temp_message.find('8=')) + 1
+            body_end = temp_message.rfind('\x01')
+            body_length = len(temp_message[body_start:body_end])
+            
+            # Insert body length
+            fields['9'] = str(body_length)
+            
+            # Rebuild message
+            message_without_checksum = self.parser.build_fix_message(fields)
+            
+            # Calculate and append checksum
+            checksum = self.parser.calculate_checksum(message_without_checksum)
+            fields['10'] = checksum
+            
+            # Final message
+            final_message = self.parser.build_fix_message(fields)
+            
+            # Send message
+            self.writer.write(final_message.encode('ascii'))
+            await self.writer.drain()
+            
+            self.sequence_number += 1
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to send message: {e}")
+            return False
+    
+    async def send_custom_message(self, message: str) -> Tuple[bool, Optional[str]]:
+        """Send custom FIX message and wait for response"""
+        if not self.connected:
+            return False, "Not connected"
+        
+        try:
+            # Parse the input message
+            fields = self.parser.parse_fix_message(message)
+            
+            # Update sequence number and sending time
+            fields['34'] = str(self.sequence_number)
+            fields['52'] = datetime.utcnow().strftime('%Y%m%d-%H:%M:%S.%f')[:-3]
+            fields['49'] = self.config.sender_comp_id
+            fields['56'] = self.config.target_comp_id
+            
+            # Send message
+            if await self._send_message(fields):
+                # Wait for response
+                response = await self._wait_for_response()
+                return True, response
+            
+        except Exception as e:
+            logging.error(f"Failed to send custom message: {e}")
+            return False, str(e)
+        
+        return False, "Failed to send message"
+    
+    async def _wait_for_response(self, timeout: int = 5) -> Optional[str]:
+        """Wait for FIX response message"""
+        try:
+            response = await asyncio.wait_for(
+                self.reader.readuntil(b'\x01'),
+                timeout=timeout
+            )
+            return response.decode('ascii', errors='ignore')
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            logging.error(f"Error reading response: {e}")
+            return None
+
+
+class FixInjector:
+    """Main FIX message injector class"""
+    
+    def __init__(self, fix_config: FixConfig, injector_config: InjectorConfig):
+        self.fix_config = fix_config
+        self.injector_config = injector_config
+        self.connection = FixConnection(fix_config)
+        self.results: List[MessageResult] = []
+        self.rate_limiter = asyncio.Semaphore(injector_config.max_concurrent)
+        
+        # Setup logging
+        if injector_config.enable_logging:
+            logging.basicConfig(
+                level=getattr(logging, injector_config.log_level),
+                format='%(asctime)s - %(levelname)s - %(message)s'
+            )
+    
+    def load_messages(self) -> List[str]:
+        """Load FIX messages from file"""
+        messages = []
+        file_path = Path(self.injector_config.input_file)
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"Input file not found: {file_path}")
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line and not line.startswith('#'):  # Skip empty lines and comments
+                    messages.append(line)
+        
+        logging.info(f"Loaded {len(messages)} messages from {file_path}")
+        return messages
+    
+    async def inject_message(self, sequence: int, message: str) -> MessageResult:
+        """Inject a single FIX message"""
+        async with self.rate_limiter:
+            start_time = time.time()
+            sent_time = datetime.now().isoformat()
+            
+            result = MessageResult(
+                sequence_number=sequence,
+                sent_time=sent_time,
+                message=message
+            )
+            
+            try:
+                success, response = await self.connection.send_custom_message(message)
+                
+                if success:
+                    result.response = response
+                    result.response_time = datetime.now().isoformat()
+                    result.latency_ms = (time.time() - start_time) * 1000
+                else:
+                    result.error = response or "Unknown error"
+                
+            except Exception as e:
+                result.error = str(e)
+            
+            return result
+    
+    async def inject_messages_batch(self, messages: List[str], start_sequence: int) -> List[MessageResult]:
+        """Inject a batch of messages concurrently"""
+        tasks = []
+        
+        for i, message in enumerate(messages):
+            task = self.inject_message(start_sequence + i, message)
+            tasks.append(task)
+        
+        return await asyncio.gather(*tasks)
+    
+    async def run_injection(self):
+        """Main injection process"""
+        try:
+            # Load messages
+            messages = self.load_messages()
+            total_messages = len(messages)
+            
+            if total_messages == 0:
+                logging.warning("No messages to inject")
+                return
+            
+            # Connect to FIX server
+            if not await self.connection.connect():
+                raise Exception("Failed to connect to FIX server")
+            
+            # Calculate timing
+            batch_size = self.injector_config.batch_size
+            rate_per_second = self.injector_config.message_rate
+            batch_delay = batch_size / rate_per_second if rate_per_second > 0 else 0
+            
+            logging.info(f"Starting injection of {total_messages} messages at {rate_per_second} msg/sec")
+            
+            # Process messages in batches
+            start_time = time.time()
+            sequence_counter = 1
+            
+            for i in range(0, total_messages, batch_size):
+                batch = messages[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                # Inject batch
+                batch_results = await self.inject_messages_batch(batch, sequence_counter)
+                self.results.extend(batch_results)
+                
+                sequence_counter += len(batch)
+                
+                # Rate limiting
+                batch_elapsed = time.time() - batch_start_time
+                if batch_delay > batch_elapsed:
+                    await asyncio.sleep(batch_delay - batch_elapsed)
+                
+                # Progress logging
+                processed = min(i + batch_size, total_messages)
+                elapsed = time.time() - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                
+                logging.info(f"Processed {processed}/{total_messages} messages "
+                           f"({processed/total_messages*100:.1f}%) - Rate: {rate:.1f} msg/sec")
+            
+            # Final statistics
+            total_elapsed = time.time() - start_time
+            actual_rate = total_messages / total_elapsed if total_elapsed > 0 else 0
+            
+            logging.info(f"Injection completed in {total_elapsed:.2f}s - "
+                        f"Actual rate: {actual_rate:.1f} msg/sec")
+            
+        except Exception as e:
+            logging.error(f"Injection failed: {e}")
+            raise
+        
+        finally:
+            await self.connection.disconnect()
+    
+    def save_results(self):
+        """Save injection results to file"""
+        output_path = Path(self.injector_config.output_file)
+        
+        # Create output directory if it doesn't exist
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Determine output format based on file extension
+        if output_path.suffix.lower() == '.json':
+            self._save_json_results(output_path)
+        elif output_path.suffix.lower() == '.csv':
+            self._save_csv_results(output_path)
+        else:
+            # Default to CSV
+            output_path = output_path.with_suffix('.csv')
+            self._save_csv_results(output_path)
+        
+        logging.info(f"Results saved to {output_path}")
+    
+    def _save_json_results(self, output_path: Path):
+        """Save results as JSON"""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump([asdict(result) for result in self.results], f, indent=2)
+    
+    def _save_csv_results(self, output_path: Path):
+        """Save results as CSV"""
+        if not self.results:
+            return
+        
+        fieldnames = list(asdict(self.results[0]).keys())
+        
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for result in self.results:
+                writer.writerow(asdict(result))
+    
+    def get_statistics(self) -> Dict:
+        """Get injection statistics"""
+        if not self.results:
+            return {}
+        
+        successful = [r for r in self.results if r.error is None]
+        failed = [r for r in self.results if r.error is not None]
+        
+        latencies = [r.latency_ms for r in successful if r.latency_ms is not None]
+        
+        stats = {
+            'total_messages': len(self.results),
+            'successful': len(successful),
+            'failed': len(failed),
+            'success_rate': len(successful) / len(self.results) * 100,
+        }
+        
+        if latencies:
+            stats.update({
+                'avg_latency_ms': sum(latencies) / len(latencies),
+                'min_latency_ms': min(latencies),
+                'max_latency_ms': max(latencies),
+            })
+        
+        return stats
+
+
+def load_config(config_file: str) -> Tuple[FixConfig, InjectorConfig]:
+    """Load configuration from file"""
+    config_path = Path(config_file)
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        if config_path.suffix.lower() in ['.yaml', '.yml']:
+            config_data = yaml.safe_load(f)
+        else:
+            config_data = json.load(f)
+    
+    fix_config = FixConfig(**config_data['fix_connection'])
+    injector_config = InjectorConfig(**config_data['injection'])
+    
+    return fix_config, injector_config
+
+
+def create_sample_config():
+    """Create a sample configuration file"""
+    sample_config = {
+        "fix_connection": {
+            "host": "localhost",
+            "port": 9876,
+            "sender_comp_id": "CLIENT",
+            "target_comp_id": "SERVER",
+            "username": "user123",
+            "password": "pass123",
+            "heartbeat_interval": 30,
+            "logon_timeout": 10,
+            "socket_timeout": 5
+        },
+        "injection": {
+            "input_file": "fix_messages.txt",
+            "output_file": "injection_results.csv",
+            "message_rate": 500,
+            "max_concurrent": 20,
+            "batch_size": 100,
+            "response_timeout": 5,
+            "enable_logging": True,
+            "log_level": "INFO"
+        }
+    }
+    
+    with open('fix_injector_config.json', 'w') as f:
+        json.dump(sample_config, f, indent=2)
+    
+    print("Sample configuration created: fix_injector_config.json")
+
+
+def create_sample_messages():
+    """Create a sample FIX messages file"""
+    sample_messages = [
+        # Sample New Order Single messages
+        "8=FIX.4.4\x019=196\x0135=D\x0149=CLIENT\x0156=SERVER\x0134=1\x0152=20240101-10:00:00\x0111=12345\x0121=1\x0155=MSFT\x0154=1\x0160=20240101-10:00:00\x0138=100\x0140=2\x0144=25.50\x0110=123\x01",
+        "8=FIX.4.4\x019=196\x0135=D\x0149=CLIENT\x0156=SERVER\x0134=2\x0152=20240101-10:00:01\x0111=12346\x0121=1\x0155=AAPL\x0154=1\x0160=20240101-10:00:01\x0138=200\x0140=2\x0144=150.25\x0110=124\x01",
+        "8=FIX.4.4\x019=196\x0135=D\x0149=CLIENT\x0156=SERVER\x0134=3\x0152=20240101-10:00:02\x0111=12347\x0121=1\x0155=GOOGL\x0154=2\x0160=20240101-10:00:02\x0138=50\x0140=2\x0144=2800.75\x0110=125\x01",
+    ]
+    
+    with open('sample_fix_messages.txt', 'w') as f:
+        for message in sample_messages:
+            f.write(message + '\n')
+    
+    print("Sample messages file created: sample_fix_messages.txt")
+
+
+async def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description='FIX Message Injector Utility')
+    parser.add_argument('--config', '-c', default='fix_injector_config.json',
+                       help='Configuration file path')
+    parser.add_argument('--create-config', action='store_true',
+                       help='Create sample configuration file')
+    parser.add_argument('--create-messages', action='store_true',
+                       help='Create sample messages file')
+    parser.add_argument('--stats', action='store_true',
+                       help='Show detailed statistics after injection')
+    
+    args = parser.parse_args()
+    
+    if args.create_config:
+        create_sample_config()
+        return
+    
+    if args.create_messages:
+        create_sample_messages()
+        return
+    
+    try:
+        # Load configuration
+        fix_config, injector_config = load_config(args.config)
+        
+        # Create and run injector
+        injector = FixInjector(fix_config, injector_config)
+        
+        print("Starting FIX message injection...")
+        await injector.run_injection()
+        
+        # Save results
+        injector.save_results()
+        
+        # Show statistics
+        stats = injector.get_statistics()
+        print("\nInjection Statistics:")
+        print(f"Total Messages: {stats.get('total_messages', 0)}")
+        print(f"Successful: {stats.get('successful', 0)}")
+        print(f"Failed: {stats.get('failed', 0)}")
+        print(f"Success Rate: {stats.get('success_rate', 0):.2f}%")
+        
+        if 'avg_latency_ms' in stats:
+            print(f"Average Latency: {stats['avg_latency_ms']:.2f}ms")
+            print(f"Min Latency: {stats['min_latency_ms']:.2f}ms")
+            print(f"Max Latency: {stats['max_latency_ms']:.2f}ms")
+        
+        if args.stats:
+            print(f"\nDetailed Statistics: {stats}")
+        
+    except Exception as e:
+        logging.error(f"Application error: {e}")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+-----------------
+
+# requirements.txt
+asyncio-throttle==1.0.2
+PyYAML>=6.0
+aiofiles>=0.8.0
+
+# setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name="fix-injector",
+    version="1.0.0",
+    description="High-performance FIX message injector utility",
+    packages=find_packages(),
+    install_requires=[
+        "PyYAML>=6.0",
+        "aiofiles>=0.8.0",
+    ],
+    entry_points={
+        'console_scripts': [
+            'fix-injector=fix_injector:main',
+        ],
+    },
+    python_requires=">=3.8",
+)
+
+# Docker file for containerized deployment
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY fix_injector.py .
+
+ENTRYPOINT ["python", "fix_injector.py"]
+
+# Sample configuration file (JSON format)
+# fix_injector_config.json
+{
+  "fix_connection": {
+    "host": "localhost",
+    "port": 9876,
+    "sender_comp_id": "CLIENT_001",
+    "target_comp_id": "EXCHANGE_SRV",
+    "username": "trader_user",
+    "password": "secure_password",
+    "heartbeat_interval": 30,
+    "logon_timeout": 10,
+    "socket_timeout": 5
+  },
+  "injection": {
+    "input_file": "fix_messages.txt",
+    "output_file": "results/injection_results.csv",
+    "message_rate": 500,
+    "max_concurrent": 20,
+    "batch_size": 100,
+    "response_timeout": 5,
+    "enable_logging": true,
+    "log_level": "INFO"
+  }
+}
+
+# Alternative YAML configuration
+# fix_injector_config.yaml
+fix_connection:
+  host: localhost
+  port: 9876
+  sender_comp_id: CLIENT_001
+  target_comp_id: EXCHANGE_SRV
+  username: trader_user
+  password: secure_password
+  heartbeat_interval: 30
+  logon_timeout: 10
+  socket_timeout: 5
+
+injection:
+  input_file: fix_messages.txt
+  output_file: results/injection_results.csv
+  message_rate: 500
+  max_concurrent: 20
+  batch_size: 100
+  response_timeout: 5
+  enable_logging: true
+  log_level: INFO
+
+
+-----------
+
+# Create sample configuration and messages
+python fix_injector.py --create-config
+python fix_injector.py --create-messages
+
+# Run injection with default config
+python fix_injector.py
+
+# Run with custom config and detailed stats
+python fix_injector.py --config my_config.yaml --stats
+
+# Using Docker
+docker build -t fix-injector .
+docker run -v $(pwd):/app fix-injector --config config.json
+
+-------------------
+
+Perfect! Let me show you how to set up and run the FIX injector utility locally with your 1000 FIX messages without Docker.
+Step-by-Step Setup and Execution
+1. Install Python Dependencies
+First, create a virtual environment and install the required packages:
+bash# Create virtual environment
+python -m venv fix_injector_env
+
+# Activate virtual environment
+# On Windows:
+fix_injector_env\Scripts\activate
+# On Linux/Mac:
+source fix_injector_env/bin/activate
+
+# Install dependencies
+pip install PyYAML aiofiles
+2. Create Your Project Structure
+fix_injector/
+├── fix_injector.py          # Main utility (from the artifact above)
+├── fix_injector_config.json # Configuration file
+├── tcr_messages.txt         # Your 1000 FIX messages
+└── results/                 # Output directory (will be created)
+3. Prepare Your FIX Messages File
+Create a file called tcr_messages.txt and put your 1000 FIX messages in it, one message per line:
+8=FIX.4.4|9=178|35=D|49=CLIENT|56=SERVER|34=1|52=20240612-10:00:00|11=TCR001|21=1|55=AAPL|54=1|60=20240612-10:00:00|38=100|40=2|44=150.25|10=123|
+8=FIX.4.4|9=178|35=D|49=CLIENT|56=SERVER|34=2|52=20240612-10:00:01|11=TCR002|21=1|55=MSFT|54=1|60=20240612-10:00:01|38=200|40=2|44=85.50|10=124|
+... (your remaining 998 messages)
+Note: Replace the | characters with the actual FIX field separator \x01 (SOH character) in your file.
+4. Configure the Connection
+Create fix_injector_config.json with your FIX server details:Configuration File for 1000 TCR MessagesCode {
+  "fix_connection": {
+    "host": "your-fix-server.com",
+    "port": 9876,
+    "sender_comp_id": "YOUR_CLIENT_ID",
+    "target_comp_id": "TCR_SERVER",
+    "username": "your_username",
+    "password": "your_password",
+    "heartbeat_interval": 30,
+ 5. Running the Utility
+Here are different ways to run it based on your needs:
+Basic Run (100 messages/second):
+bashpython fix_injector.py --config fix_injector_config.json
+High-Speed Run (500 messages/second):
+First, update your config file:
+json{
+  "injection": {
+    "message_rate": 500,
+    "max_concurrent": 20,
+    "batch_size": 100,
+    ...
+  }
+}
+Then run:
+bashpython fix_injector.py --config fix_injector_config.json --stats
+Conservative Run (50 messages/second for testing):
+json{
+  "injection": {
+    "message_rate": 50,
+    "max_concurrent": 5,
+    "batch_size": 25,
+    ...
+  }
+}
+6. Expected Output
+When you run the utility, you'll see output like:
+2024-06-12 10:00:00,123 - INFO - Loaded 1000 messages from tcr_messages.txt
+2024-06-12 10:00:01,456 - INFO - Connected to your-fix-server.com:9876
+2024-06-12 10:00:02,789 - INFO - Starting injection of 1000 messages at 100 msg/sec
+2024-06-12 10:00:05,234 - INFO - Processed 50/1000 messages (5.0%) - Rate: 98.5 msg/sec
+2024-06-12 10:00:07,567 - INFO - Processed 100/1000 messages (10.0%) - Rate: 99.2 msg/sec
+...
+2024-06-12 10:00:45,890 - INFO - Processed 1000/1000 messages (100.0%) - Rate: 100.1 msg/sec
+2024-06-12 10:00:46,123 - INFO - Injection completed in 43.65s - Actual rate: 100.3 msg/sec
+2024-06-12 10:00:46,456 - INFO - Results saved to results/tcr_injection_results.csv
+2024-06-12 10:00:46,789 - INFO - Disconnected from FIX server
+
+Injection Statistics:
+Total Messages: 1000
+Successful: 987
+Failed: 13
+Success Rate: 98.70%
+Average Latency: 25.34ms
+Min Latency: 12.45ms
+Max Latency: 156.78ms
+7. Results Analysis
+After execution, you'll get a CSV file (results/tcr_injection_results.csv) with columns:
+
+sequence_number: Message sequence
+sent_time: When message was sent
+message: The actual FIX message sent
+response: Response received from server
+response_time: When response was received
+error: Any error that occurred
+latency_ms: Round-trip latency in milliseconds
+
+8. Troubleshooting Tips
+If connection fails:
+bash# Test with minimal config first
+python fix_injector.py --create-config
+# Edit the generated config with your actual server details
+If messages are malformed:
+
+Ensure FIX messages use \x01 as field separator
+Check that each message is on a separate line
+Verify FIX message structure (proper tags, checksums)
+
+For better performance with 1000 messages:
+json{
+  "injection": {
+    "message_rate": 200,
+    "max_concurrent": 15,
+    "batch_size": 50,
+    "response_timeout": 3
+  }
+}
+9. Quick Start Commands
+bash# 1. Save the fix_injector.py file
+# 2. Create your config and message files
+# 3. Run these commands:
+
+# Install dependencies
+pip install PyYAML aiofiles
+
+# Create results directory
+mkdir results
+
+# Run the injector
+python fix_injector.py --config fix_injector_config.json --stats
+This setup will efficiently process your 1000 TCR FIX messages, capture all responses, measure latencies, and provide comprehensive statistics - all running locally without any deployment complexity!
+
+
+fix_injector_config.json 
+
+{
+  "fix_connection": {
+    "host": "your-fix-server.com",
+    "port": 9876,
+    "sender_comp_id": "YOUR_CLIENT_ID",
+    "target_comp_id": "TCR_SERVER",
+    "username": "your_username",
+    "password": "your_password",
+    "heartbeat_interval": 30,
+    "logon_timeout": 15,
+    "socket_timeout": 10
+  },
+  "injection": {
+    "input_file": "tcr_messages.txt",
+    "output_file": "results/tcr_injection_results.csv",
+    "message_rate": 100,
+    "max_concurrent": 10,
+    "batch_size": 50,
+    "response_timeout": 5,
+    "enable_logging": true,
+    "log_level": "INFO"
+  }
+}
