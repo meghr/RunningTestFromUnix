@@ -1,0 +1,648 @@
+flask 
+
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+import paramiko
+import os
+from datetime import datetime
+import logging
+import json
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Pre-configured system hosts (you can modify this list)
+SYSTEM_HOSTS = {
+    "production-server": {
+        "hostname": "prod.example.com",
+        "description": "Production Server",
+        "port": 22
+    },
+    "staging-server": {
+        "hostname": "staging.example.com", 
+        "description": "Staging Server",
+        "port": 22
+    },
+    "development-server": {
+        "hostname": "dev.example.com",
+        "description": "Development Server", 
+        "port": 22
+    },
+    "database-server": {
+        "hostname": "db.example.com",
+        "description": "Database Server",
+        "port": 22
+    },
+    "custom": {
+        "hostname": "",
+        "description": "Custom Host",
+        "port": 22
+    }
+}
+
+@app.route('/')
+def index():
+    return render_template('index.html', hosts=SYSTEM_HOSTS)
+
+@app.route('/get_host_info/<host_key>')
+def get_host_info(host_key):
+    """API endpoint to get host information"""
+    if host_key in SYSTEM_HOSTS:
+        return jsonify(SYSTEM_HOSTS[host_key])
+    return jsonify({"error": "Host not found"}), 404
+
+@app.route('/test_connection', methods=['POST'])
+def test_connection():
+    """Test SSH connection without executing script"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        hostname = data.get('hostname')
+        
+        if not all([username, password, hostname]):
+            return jsonify({"success": False, "message": "Missing required fields"})
+        
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        ssh_client.connect(hostname, username=username, password=password, timeout=10)
+        ssh_client.close()
+        
+        return jsonify({"success": True, "message": "Connection successful!"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Connection failed: {str(e)}"})
+
+@app.route('/execute', methods=['POST'])
+def execute_script():
+    try:
+        # Get form data
+        username = request.form['username']
+        password = request.form['password']
+        host_key = request.form['host_selection']
+        custom_hostname = request.form.get('custom_hostname', '')
+        script_path = request.form['script_path']
+        parameters = request.form['parameters']
+        output_folder = request.form['output_folder']
+        
+        # Determine hostname
+        if host_key == 'custom':
+            hostname = custom_hostname
+            if not hostname:
+                flash('Custom hostname is required when "Custom Host" is selected!', 'error')
+                return redirect(url_for('index'))
+        else:
+            hostname = SYSTEM_HOSTS[host_key]['hostname']
+        
+        # Validate inputs
+        if not all([username, password, hostname, script_path, output_folder]):
+            flash('All required fields must be filled!', 'error')
+            return redirect(url_for('index'))
+        
+        # Create output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # SSH connection and script execution
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            # Connect to remote host
+            ssh_client.connect(hostname, username=username, password=password, timeout=30)
+            
+            # Prepare command with parameters
+            if parameters:
+                # Clean up parameters - remove extra spaces and handle comma separation
+                param_list = [p.strip() for p in parameters.split(',') if p.strip()]
+                command = f"{script_path} {' '.join(param_list)}"
+            else:
+                command = script_path
+            
+            logger.info(f"Executing command on {hostname}: {command}")
+            
+            # Execute the script
+            stdin, stdout, stderr = ssh_client.exec_command(command)
+            
+            # Get output
+            output = stdout.read().decode('utf-8')
+            error_output = stderr.read().decode('utf-8')
+            exit_status = stdout.channel.recv_exit_status()
+            
+            # Generate output filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"script_output_{hostname.replace('.', '_')}_{timestamp}.txt"
+            output_file_path = os.path.join(output_folder, output_filename)
+            
+            # Write output to file
+            with open(output_file_path, 'w') as f:
+                f.write(f"Remote Script Execution Report\n")
+                f.write(f"=" * 50 + "\n")
+                f.write(f"Host: {hostname}\n")
+                f.write(f"Command: {command}\n")
+                f.write(f"Execution Time: {datetime.now()}\n")
+                f.write(f"Exit Status: {exit_status}\n")
+                f.write(f"=" * 50 + "\n\n")
+                
+                if output:
+                    f.write("STANDARD OUTPUT:\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(output)
+                    f.write("\n\n")
+                
+                if error_output:
+                    f.write("ERROR OUTPUT:\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(error_output)
+                    f.write("\n")
+            
+            if exit_status == 0:
+                flash(f'✅ Script executed successfully! Output saved to: {output_file_path}', 'success')
+            else:
+                flash(f'⚠️ Script executed with exit code {exit_status}. Check output file: {output_file_path}', 'warning')
+            
+        finally:
+            ssh_client.close()
+            
+    except Exception as e:
+        logger.error(f"Error executing script: {str(e)}")
+        flash(f'❌ Error: {str(e)}', 'error')
+    
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+
+
+
+
+-------------
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Script Executor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50, #34495e);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1rem;
+        }
+        
+        .form-container {
+            padding: 40px;
+        }
+        
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 0.95rem;
+        }
+        
+        input[type="text"], 
+        input[type="password"], 
+        select, 
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            background-color: #f8f9fa;
+        }
+        
+        input:focus, 
+        select:focus, 
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            background-color: white;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        select {
+            cursor: pointer;
+        }
+        
+        textarea {
+            height: 80px;
+            resize: vertical;
+        }
+        
+        .custom-host-group {
+            display: none;
+            margin-top: 15px;
+            padding: 15px;
+            background-color: #f1f3f4;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+        }
+        
+        .btn {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            flex: 1;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #5a6268;
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+        
+        .alert {
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+        
+        .alert-success {
+            background-color: #d4edda;
+            color: #155724;
+            border-left: 4px solid #28a745;
+        }
+        
+        .alert-error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border-left: 4px solid #dc3545;
+        }
+        
+        .alert-warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .host-info {
+            background-color: #e3f2fd;
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 8px;
+            font-size: 0.9rem;
+            color: #1565c0;
+        }
+        
+        .connection-status {
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 10px;
+            font-weight: 500;
+            display: none;
+        }
+        
+        .status-success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status-error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        
+        .folder-input-group {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .folder-input-group input {
+            flex: 1;
+        }
+        
+        .folder-btn {
+            background-color: #6c757d;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        
+        .folder-btn:hover {
+            background-color: #5a6268;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        @media (max-width: 768px) {
+            .form-grid {
+                grid-template-columns: 1fr;
+                gap: 20px;
+            }
+            
+            .button-group {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🖥️ Remote Script Executor</h1>
+            <p>Execute shell scripts on remote systems with ease</p>
+        </div>
+        
+        <div class="form-container">
+            <!-- Flash messages -->
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ 'success' if category == 'success' else 'warning' if category == 'warning' else 'error' }}">
+                            {{ message }}
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            
+            <form method="POST" action="/execute" id="executorForm">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="username">👤 Username:</label>
+                        <input type="text" id="username" name="username" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="password">🔒 Password:</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="host_selection">🌐 System Host:</label>
+                        <select id="host_selection" name="host_selection" required>
+                            <option value="">Select a system host...</option>
+                            {% for key, host in hosts.items() %}
+                                <option value="{{ key }}" data-hostname="{{ host.hostname }}" data-description="{{ host.description }}">
+                                    {{ host.description }}{% if host.hostname %} ({{ host.hostname }}){% endif %}
+                                </option>
+                            {% endfor %}
+                        </select>
+                        <div id="host-info" class="host-info" style="display: none;"></div>
+                        
+                        <div id="custom-host-group" class="custom-host-group">
+                            <label for="custom_hostname">Enter Custom Hostname:</label>
+                            <input type="text" id="custom_hostname" name="custom_hostname" placeholder="192.168.1.100 or server.example.com">
+                        </div>
+                        
+                        <div id="connection-status" class="connection-status"></div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="script_path">📄 Script Path:</label>
+                        <input type="text" id="script_path" name="script_path" placeholder="/path/to/script.sh" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="parameters">⚙️ Parameters:</label>
+                        <textarea id="parameters" name="parameters" placeholder="param1, param2, param3"></textarea>
+                        <small style="color: #6c757d;">Comma-separated parameters</small>
+                    </div>
+                    
+                    <div class="form-group full-width">
+                        <label for="output_folder">📁 Output Folder:</label>
+                        <div class="folder-input-group">
+                            <input type="text" id="output_folder" name="output_folder" placeholder="/path/to/output/folder" required>
+                            <button type="button" class="folder-btn" onclick="selectFolder()">Browse</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" id="testConnectionBtn">🔌 Test Connection</button>
+                    <button type="submit" class="btn btn-primary" id="fetchBtn">🚀 Fetch & Execute</button>
+                </div>
+            </form>
+            
+            <div id="loading" class="loading">
+                <div class="spinner"></div>
+                <p>Executing script on remote host...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Host selection handling
+        document.getElementById('host_selection').addEventListener('change', function() {
+            const selectedOption = this.options[this.selectedIndex];
+            const customHostGroup = document.getElementById('custom-host-group');
+            const hostInfo = document.getElementById('host-info');
+            const connectionStatus = document.getElementById('connection-status');
+            
+            // Hide connection status when changing hosts
+            connectionStatus.style.display = 'none';
+            
+            if (this.value === 'custom') {
+                customHostGroup.style.display = 'block';
+                hostInfo.style.display = 'none';
+            } else if (this.value) {
+                customHostGroup.style.display = 'none';
+                const hostname = selectedOption.dataset.hostname;
+                const description = selectedOption.dataset.description;
+                hostInfo.innerHTML = `<strong>${description}</strong><br>Hostname: ${hostname}`;
+                hostInfo.style.display = 'block';
+            } else {
+                customHostGroup.style.display = 'none';
+                hostInfo.style.display = 'none';
+            }
+        });
+
+        // Test connection functionality
+        document.getElementById('testConnectionBtn').addEventListener('click', async function() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const hostSelection = document.getElementById('host_selection').value;
+            const customHostname = document.getElementById('custom_hostname').value;
+            
+            let hostname;
+            if (hostSelection === 'custom') {
+                hostname = customHostname;
+            } else if (hostSelection) {
+                const selectedOption = document.getElementById('host_selection').options[document.getElementById('host_selection').selectedIndex];
+                hostname = selectedOption.dataset.hostname;
+            }
+            
+            if (!username || !password || !hostname) {
+                alert('Please fill in username, password, and select a host first.');
+                return;
+            }
+            
+            const connectionStatus = document.getElementById('connection-status');
+            connectionStatus.innerHTML = 'Testing connection...';
+            connectionStatus.className = 'connection-status';
+            connectionStatus.style.display = 'block';
+            
+            this.disabled = true;
+            
+            try {
+                const response = await fetch('/test_connection', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        username: username,
+                        password: password,
+                        hostname: hostname
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    connectionStatus.innerHTML = `✅ ${result.message}`;
+                    connectionStatus.className = 'connection-status status-success';
+                } else {
+                    connectionStatus.innerHTML = `❌ ${result.message}`;
+                    connectionStatus.className = 'connection-status status-error';
+                }
+            } catch (error) {
+                connectionStatus.innerHTML = `❌ Connection test failed: ${error.message}`;
+                connectionStatus.className = 'connection-status status-error';
+            }
+            
+            this.disabled = false;
+        });
+
+        // Form submission handling
+        document.getElementById('executorForm').addEventListener('submit', function(e) {
+            const loading = document.getElementById('loading');
+            const fetchBtn = document.getElementById('fetchBtn');
+            
+            loading.style.display = 'block';
+            fetchBtn.disabled = true;
+            
+            // Optional: Add timeout to re-enable button if something goes wrong
+            setTimeout(() => {
+                loading.style.display = 'none';
+                fetchBtn.disabled = false;
+            }, 30000); // 30 seconds timeout
+        });
+
+        // Folder selection (simplified for web)
+        function selectFolder() {
+            const currentPath = document.getElementById('output_folder').value || '/home/user/output';
+            const newPath = prompt('Enter the full path to output folder:', currentPath);
+            if (newPath && newPath.trim()) {
+                document.getElementById('output_folder').value = newPath.trim();
+            }
+        }
+
+        // Auto-focus on first input
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('username').focus();
+        });
+    </script>
+</body>
+</html>
