@@ -138,6 +138,7 @@ class SSHExecutor:
             buffer = ""
             start_time = time.time()
             last_output_time = time.time()
+            input_timeout = 0
             
             while not self.stop_execution:
                 # Check for timeout
@@ -155,10 +156,16 @@ class SSHExecutor:
                         if data:
                             buffer += data
                             last_output_time = time.time()
+                            input_timeout = 0  # Reset input timeout
                             
                             # Process complete lines
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
+                            lines = buffer.split('\n')
+                            # Keep the last incomplete line in buffer
+                            complete_lines = lines[:-1]
+                            buffer = lines[-1]
+                            
+                            # Send complete lines to output
+                            for line in complete_lines:
                                 self._process_output_line(line + '\n')
                             
                             # Update progress
@@ -168,9 +175,30 @@ class SSHExecutor:
                             })
                     
                     # Check if script is waiting for input
-                    if buffer and self._is_waiting_for_input(buffer):
-                        socketio.emit('waiting_for_input', {'prompt': buffer.strip()})
-                        # Don't process this as output yet, wait for input
+                    # We check both the buffer and if there's been no new output for a while
+                    current_time = time.time()
+                    no_output_time = current_time - last_output_time
+                    
+                    if buffer and (self._is_waiting_for_input(buffer) or no_output_time > 3):
+                        # If we haven't detected input prompt yet, wait a bit more
+                        if not self._is_waiting_for_input(buffer) and no_output_time < 5:
+                            time.sleep(0.5)
+                            continue
+                            
+                        # Show input prompt
+                        prompt_text = buffer.strip() if buffer.strip() else "Script is waiting for input:"
+                        socketio.emit('waiting_for_input', {'prompt': prompt_text})
+                        
+                        # Wait for user input (with timeout)
+                        input_start = time.time()
+                        while not self.stop_execution and (time.time() - input_start) < 300:  # 5 minute timeout for input
+                            time.sleep(0.1)
+                            # Check if input was provided (buffer should be processed)
+                            if self.channel.recv_ready():
+                                break
+                        
+                        # Clear the buffer after input prompt
+                        buffer = ""
                         continue
                     
                     # Check if channel is closed
@@ -181,7 +209,7 @@ class SSHExecutor:
                         break
                     
                     # Check for inactivity (script might be done)
-                    if time.time() - last_output_time > 5 and not buffer:
+                    if time.time() - last_output_time > 10 and not buffer:
                         if self.channel.exit_status_ready():
                             break
                 
@@ -216,12 +244,341 @@ class SSHExecutor:
     
     def _is_waiting_for_input(self, buffer):
         """Check if the script is waiting for user input"""
-        # Common input prompts
-        input_indicators = [':', '?', 'enter', 'input', 'Enter', 'Input', 'Password']
-        buffer_lower = buffer.lower().strip()
+        # Common input prompts - more comprehensive detection
+        input_indicators = [
+            ':', '?', '>', '
+    
+    def send_input(self, user_input):
+        """Send user input to the script"""
+        try:
+            if self.channel and not self.channel.closed:
+                input_line = user_input + '\n'
+                self.channel.send(input_line)
+                
+                # Log the input
+                if self.output_file:
+                    self.output_file.write(f"User input: {user_input}\n")
+                    self.output_file.flush()
+                
+                socketio.emit('output', {'data': f"User input: {user_input}\n"})
+                logger.info(f"Sent user input: {user_input}")
+                return True
+        except Exception as e:
+            logger.error(f"Error sending input: {e}")
+            return False
+        return False
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_execution = True
+        
+        if self.channel:
+            self.channel.close()
+        
+        if self.client:
+            self.client.close()
+        
+        if self.output_file and not self.output_file.closed:
+            self.output_file.close()
+
+# Global executor instance
+current_executor = None
+
+@app.route('/')
+def index():
+    """Main page"""
+    # Get saved credentials from session
+    username = session.get('username', '')
+    password = session.get('password', '')
+    
+    # Generate default output path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    default_output = os.path.join(DEFAULT_OUTPUT_DIR, f'output_{timestamp}.txt')
+    
+    return render_template('index.html',
+                         hosts=HOSTS,
+                         default_script_path=DEFAULT_SCRIPT_PATH,
+                         default_output_path=default_output,
+                         saved_username=username,
+                         saved_password=password)
+
+@app.route('/validate', methods=['POST'])
+def validate_inputs():
+    """Validate form inputs"""
+    data = request.json
+    errors = []
+    
+    if not data.get('username'):
+        errors.append('Username is required')
+    
+    if not data.get('password'):
+        errors.append('Password is required')
+    
+    if not data.get('host'):
+        errors.append('Host is required')
+    
+    if not data.get('script_path'):
+        errors.append('Script path is required')
+    
+    if not data.get('output_path'):
+        errors.append('Output path is required')
+    
+    # Validate output directory exists
+    output_dir = os.path.dirname(data.get('output_path', ''))
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            errors.append(f'Cannot create output directory: {str(e)}')
+    
+    return jsonify({'valid': len(errors) == 0, 'errors': errors})
+
+@socketio.on('execute_script')
+def handle_execute_script(data):
+    """Handle script execution request"""
+    global current_executor
+    
+    try:
+        # Save credentials to session
+        session['username'] = data['username']
+        session['password'] = data['password']
+        
+        # Clean up previous executor
+        if current_executor:
+            current_executor.cleanup()
+        
+        # Create new executor
+        current_executor = SSHExecutor(
+            host=data['host'],
+            username=data['username'],
+            password=data['password'],
+            script_path=data['script_path'],
+            output_path=data['output_path']
+        )
+        
+        # Execute in separate thread
+        def execute():
+            if current_executor.connect():
+                if current_executor.verify_script():
+                    current_executor.execute_script()
+        
+        execution_thread = threading.Thread(target=execute)
+        execution_thread.daemon = True
+        execution_thread.start()
+        
+    except Exception as e:
+        emit('error', {'message': f'Execution failed: {str(e)}'})
+
+@socketio.on('send_input')
+def handle_send_input(data):
+    """Handle user input for the script"""
+    global current_executor
+    
+    if current_executor:
+        user_input = data.get('input', '')
+        current_executor.send_input(user_input)
+
+@socketio.on('stop_execution')
+def handle_stop_execution():
+    """Handle stop execution request"""
+    global current_executor
+    
+    if current_executor:
+        current_executor.cleanup()
+        emit('execution_stopped')
+
+if __name__ == '__main__':
+    print("Starting Remote Script Execution Utility...")
+    print(f"Default script path: {DEFAULT_SCRIPT_PATH}")
+    print(f"Default output directory: {DEFAULT_OUTPUT_DIR}")
+    print(f"Available hosts: {', '.join(HOSTS)}")
+    print("Access the application at: http://localhost:5000")
+    
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000), '#',  # Common prompt endings
+            'enter', 'input', 'type', 'choose', 'select',  # Command words
+            'Enter', 'Input', 'Type', 'Choose', 'Select',  # Capitalized
+            'password', 'Password', 'name', 'Name',  # Common fields
+            'continue', 'Continue', 'proceed', 'Proceed',  # Continuation
+            'press', 'Press', 'hit', 'Hit',  # Key press instructions
+            'y/n', 'Y/N', 'yes/no', 'Yes/No',  # Yes/No prompts
+            '[y/n]', '[Y/N]', '(y/n)', '(Y/N)',  # Bracketed prompts
+        ]
+        
+        buffer_stripped = buffer.strip()
+        buffer_lower = buffer_stripped.lower()
+        
+        # If buffer is empty, not waiting for input
+        if not buffer_stripped:
+            return False
         
         # Check if it ends with common prompt indicators
-        return any(buffer_lower.endswith(indicator.lower()) for indicator in input_indicators)
+        for indicator in input_indicators:
+            if buffer_lower.endswith(indicator.lower()):
+                return True
+        
+        # Check for lines that don't end with newline (incomplete output)
+        # This often indicates the script is waiting for input
+        if not buffer.endswith('\n') and len(buffer_stripped) > 0:
+            # Additional checks for input-like patterns
+            if any(word in buffer_lower for word in ['enter', 'input', 'type', 'choose', 'select', 'password', 'name']):
+                return True
+            
+            # Check if line ends with common prompt characters
+            if buffer_stripped[-1] in ':?>#
+    
+    def send_input(self, user_input):
+        """Send user input to the script"""
+        try:
+            if self.channel and not self.channel.closed:
+                input_line = user_input + '\n'
+                self.channel.send(input_line)
+                
+                # Log the input
+                if self.output_file:
+                    self.output_file.write(f"User input: {user_input}\n")
+                    self.output_file.flush()
+                
+                socketio.emit('output', {'data': f"User input: {user_input}\n"})
+                return True
+        except Exception as e:
+            logger.error(f"Error sending input: {e}")
+            return False
+        return False
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_execution = True
+        
+        if self.channel:
+            self.channel.close()
+        
+        if self.client:
+            self.client.close()
+        
+        if self.output_file and not self.output_file.closed:
+            self.output_file.close()
+
+# Global executor instance
+current_executor = None
+
+@app.route('/')
+def index():
+    """Main page"""
+    # Get saved credentials from session
+    username = session.get('username', '')
+    password = session.get('password', '')
+    
+    # Generate default output path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    default_output = os.path.join(DEFAULT_OUTPUT_DIR, f'output_{timestamp}.txt')
+    
+    return render_template('index.html',
+                         hosts=HOSTS,
+                         default_script_path=DEFAULT_SCRIPT_PATH,
+                         default_output_path=default_output,
+                         saved_username=username,
+                         saved_password=password)
+
+@app.route('/validate', methods=['POST'])
+def validate_inputs():
+    """Validate form inputs"""
+    data = request.json
+    errors = []
+    
+    if not data.get('username'):
+        errors.append('Username is required')
+    
+    if not data.get('password'):
+        errors.append('Password is required')
+    
+    if not data.get('host'):
+        errors.append('Host is required')
+    
+    if not data.get('script_path'):
+        errors.append('Script path is required')
+    
+    if not data.get('output_path'):
+        errors.append('Output path is required')
+    
+    # Validate output directory exists
+    output_dir = os.path.dirname(data.get('output_path', ''))
+    if output_dir and not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            errors.append(f'Cannot create output directory: {str(e)}')
+    
+    return jsonify({'valid': len(errors) == 0, 'errors': errors})
+
+@socketio.on('execute_script')
+def handle_execute_script(data):
+    """Handle script execution request"""
+    global current_executor
+    
+    try:
+        # Save credentials to session
+        session['username'] = data['username']
+        session['password'] = data['password']
+        
+        # Clean up previous executor
+        if current_executor:
+            current_executor.cleanup()
+        
+        # Create new executor
+        current_executor = SSHExecutor(
+            host=data['host'],
+            username=data['username'],
+            password=data['password'],
+            script_path=data['script_path'],
+            output_path=data['output_path']
+        )
+        
+        # Execute in separate thread
+        def execute():
+            if current_executor.connect():
+                if current_executor.verify_script():
+                    current_executor.execute_script()
+        
+        execution_thread = threading.Thread(target=execute)
+        execution_thread.daemon = True
+        execution_thread.start()
+        
+    except Exception as e:
+        emit('error', {'message': f'Execution failed: {str(e)}'})
+
+@socketio.on('send_input')
+def handle_send_input(data):
+    """Handle user input for the script"""
+    global current_executor
+    
+    if current_executor:
+        user_input = data.get('input', '')
+        current_executor.send_input(user_input)
+
+@socketio.on('stop_execution')
+def handle_stop_execution():
+    """Handle stop execution request"""
+    global current_executor
+    
+    if current_executor:
+        current_executor.cleanup()
+        emit('execution_stopped')
+
+if __name__ == '__main__':
+    print("Starting Remote Script Execution Utility...")
+    print(f"Default script path: {DEFAULT_SCRIPT_PATH}")
+    print(f"Default output directory: {DEFAULT_OUTPUT_DIR}")
+    print(f"Available hosts: {', '.join(HOSTS)}")
+    print("Access the application at: http://localhost:5000")
+    
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000):
+                return True
+                
+            # Check for bracketed options like [y/n] or (yes/no)
+            if any(pattern in buffer_lower for pattern in ['[y/n]', '(y/n)', '[yes/no]', '(yes/no)']):
+                return True
+        
+        return False
     
     def send_input(self, user_input):
         """Send user input to the script"""
@@ -371,7 +728,7 @@ if __name__ == '__main__':
     socketio.run(app, debug=True, host='0.0.0.0', port=5000)
 
 
---------------
+-------------
 
 
 <!DOCTYPE html>
@@ -824,9 +1181,13 @@ if __name__ == '__main__':
         socket.on('output', (data) => {
             output.textContent += data.data;
             output.scrollTop = output.scrollHeight;
+            
+            // Debug: Log output to console
+            console.log('Received output:', data.data);
         });
 
         socket.on('waiting_for_input', (data) => {
+            console.log('Script waiting for input. Prompt:', data.prompt);
             showInputPrompt(data.prompt);
         });
 
@@ -864,16 +1225,4 @@ if __name__ == '__main__':
 </body>
 </html>
 
--------------
-requirements.txt
 
-Flask==2.3.3
-Flask-Session==0.5.0
-Flask-SocketIO==5.3.6
-paramiko==3.3.1
-python-socketio==5.8.0
-python-engineio==4.7.1
-Werkzeug==2.3.7
-
-
-pip install -r requirements.txt
