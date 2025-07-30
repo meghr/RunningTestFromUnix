@@ -1,415 +1,879 @@
-App
+#!/usr/bin/env python3
+"""
+Remote Script Execution Utility
+A web-based application for executing shell scripts on remote Unix hosts via SSH
+with interactive input handling and real-time output capture.
+"""
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
-import paramiko
 import os
+import threading
+import time
+import select
 from datetime import datetime
+from flask import Flask, render_template, request, session, jsonify
+from flask_session import Session
+from flask_socketio import SocketIO, emit
+import paramiko
 import logging
 
-app = Flask(__name__)
-app.secret_key = 'your-secret-key-here'
-
-# Logging setup
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# System host list (add or modify as needed)
-SYSTEM_HOSTS = {
-    "production-server": {
-        "hostname": "prod.example.com",
-        "description": "Production Server",
-        "port": 22
-    },
-    "staging-server": {
-        "hostname": "staging.example.com",
-        "description": "Staging Server",
-        "port": 22
-    },
-    "development-server": {
-        "hostname": "dev.example.com",
-        "description": "Development Server",
-        "port": 22
-    },
-    "database-server": {
-        "hostname": "db.example.com",
-        "description": "Database Server",
-        "port": 22
-    },
-    "custom": {
-        "hostname": "",
-        "description": "Custom Host",
-        "port": 22
-    }
-}
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-change-in-production'
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['SESSION_PERMANENT'] = False
 
-# Default script paths (you can extend this easily)
-DEFAULT_SCRIPT_PATHS = [
-    {"label": "~QA/bin (default)", "value": "~QA/bin"}
-]
+# Initialize session and socketio
+Session(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Configuration
+DEFAULT_SCRIPT_PATH = '/path/to/script.sh'
+DEFAULT_OUTPUT_DIR = './output'
+HOSTS = ['192.168.1.100', 'localhost', 'server1.example.com']
+SSH_TIMEOUT = 300
+BUFFER_SIZE = 65536
+
+# Ensure output directory exists
+os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+
+class SSHExecutor:
+    def __init__(self, host, username, password, script_path, output_path):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.script_path = script_path
+        self.output_path = output_path
+        self.client = None
+        self.channel = None
+        self.output_file = None
+        self.execution_thread = None
+        self.stop_execution = False
+        
+    def connect(self):
+        """Establish SSH connection"""
+        try:
+            socketio.emit('progress', {'percent': 5, 'message': 'Connecting to host...'})
+            
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.client.connect(
+                hostname=self.host,
+                username=self.username,
+                password=self.password,
+                timeout=30
+            )
+            
+            socketio.emit('progress', {'percent': 15, 'message': 'Connected successfully'})
+            return True
+            
+        except Exception as e:
+            error_msg = f"SSH connection failed: {str(e)}"
+            logger.error(error_msg)
+            socketio.emit('error', {'message': error_msg})
+            return False
+    
+    def verify_script(self):
+        """Verify script exists and is executable"""
+        try:
+            socketio.emit('progress', {'percent': 20, 'message': 'Verifying script...'})
+            
+            # Check if script exists
+            stdin, stdout, stderr = self.client.exec_command(f'test -f {self.script_path}')
+            if stdout.channel.recv_exit_status() != 0:
+                raise Exception(f"Script not found: {self.script_path}")
+            
+            # Check if script is executable
+            stdin, stdout, stderr = self.client.exec_command(f'test -x {self.script_path}')
+            if stdout.channel.recv_exit_status() != 0:
+                raise Exception(f"Script is not executable: {self.script_path}")
+            
+            socketio.emit('progress', {'percent': 25, 'message': 'Script verified'})
+            return True
+            
+        except Exception as e:
+            error_msg = f"Script verification failed: {str(e)}"
+            logger.error(error_msg)
+            socketio.emit('error', {'message': error_msg})
+            return False
+    
+    def execute_script(self):
+        """Execute the script with interactive input handling"""
+        try:
+            socketio.emit('progress', {'percent': 30, 'message': 'Starting script execution...'})
+            
+            # Open output file
+            self.output_file = open(self.output_path, 'w', encoding='utf-8', buffering=1)
+            self.output_file.write(f"Script execution started at {datetime.now()}\n")
+            self.output_file.write(f"Host: {self.host}\n")
+            self.output_file.write(f"Script: {self.script_path}\n")
+            self.output_file.write("-" * 50 + "\n")
+            
+            # Create interactive shell
+            self.channel = self.client.invoke_shell()
+            self.channel.settimeout(1.0)
+            
+            # Execute the script
+            command = f'bash {self.script_path}\n'
+            self.channel.send(command)
+            
+            # Start execution monitoring
+            self.execution_thread = threading.Thread(target=self._monitor_execution)
+            self.execution_thread.daemon = True
+            self.execution_thread.start()
+            
+            return True
+            
+        except Exception as e:
+            error_msg = f"Script execution failed: {str(e)}"
+            logger.error(error_msg)
+            socketio.emit('error', {'message': error_msg})
+            return False
+    
+    def _monitor_execution(self):
+        """Monitor script execution and handle input/output"""
+        try:
+            buffer = ""
+            start_time = time.time()
+            last_output_time = time.time()
+            
+            while not self.stop_execution:
+                # Check for timeout
+                if time.time() - start_time > SSH_TIMEOUT:
+                    socketio.emit('error', {'message': 'Script execution timeout'})
+                    break
+                
+                # Update progress based on time
+                elapsed = time.time() - start_time
+                progress = min(30 + (elapsed / SSH_TIMEOUT) * 60, 90)
+                
+                try:
+                    if self.channel.recv_ready():
+                        data = self.channel.recv(BUFFER_SIZE).decode('utf-8', errors='ignore')
+                        if data:
+                            buffer += data
+                            last_output_time = time.time()
+                            
+                            # Process complete lines
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                self._process_output_line(line + '\n')
+                            
+                            # Update progress
+                            socketio.emit('progress', {
+                                'percent': int(progress),
+                                'message': 'Executing script...'
+                            })
+                    
+                    # Check if script is waiting for input
+                    if buffer and self._is_waiting_for_input(buffer):
+                        socketio.emit('waiting_for_input', {'prompt': buffer.strip()})
+                        # Don't process this as output yet, wait for input
+                        continue
+                    
+                    # Check if channel is closed
+                    if self.channel.exit_status_ready():
+                        # Process any remaining buffer
+                        if buffer:
+                            self._process_output_line(buffer)
+                        break
+                    
+                    # Check for inactivity (script might be done)
+                    if time.time() - last_output_time > 5 and not buffer:
+                        if self.channel.exit_status_ready():
+                            break
+                
+                except Exception as e:
+                    if "timed out" not in str(e).lower():
+                        logger.error(f"Error in monitoring: {e}")
+                
+                time.sleep(0.1)
+            
+            # Script completed
+            socketio.emit('progress', {'percent': 100, 'message': 'Script execution completed'})
+            socketio.emit('execution_complete')
+            
+            if self.output_file:
+                self.output_file.write(f"\nScript execution completed at {datetime.now()}\n")
+                self.output_file.close()
+                
+        except Exception as e:
+            error_msg = f"Execution monitoring error: {str(e)}"
+            logger.error(error_msg)
+            socketio.emit('error', {'message': error_msg})
+    
+    def _process_output_line(self, line):
+        """Process and emit a line of output"""
+        # Write to file
+        if self.output_file:
+            self.output_file.write(line)
+            self.output_file.flush()
+        
+        # Emit to web interface
+        socketio.emit('output', {'data': line})
+    
+    def _is_waiting_for_input(self, buffer):
+        """Check if the script is waiting for user input"""
+        # Common input prompts
+        input_indicators = [':', '?', 'enter', 'input', 'Enter', 'Input', 'Password']
+        buffer_lower = buffer.lower().strip()
+        
+        # Check if it ends with common prompt indicators
+        return any(buffer_lower.endswith(indicator.lower()) for indicator in input_indicators)
+    
+    def send_input(self, user_input):
+        """Send user input to the script"""
+        try:
+            if self.channel and not self.channel.closed:
+                input_line = user_input + '\n'
+                self.channel.send(input_line)
+                
+                # Log the input
+                if self.output_file:
+                    self.output_file.write(f"User input: {user_input}\n")
+                    self.output_file.flush()
+                
+                socketio.emit('output', {'data': f"User input: {user_input}\n"})
+                return True
+        except Exception as e:
+            logger.error(f"Error sending input: {e}")
+            return False
+        return False
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.stop_execution = True
+        
+        if self.channel:
+            self.channel.close()
+        
+        if self.client:
+            self.client.close()
+        
+        if self.output_file and not self.output_file.closed:
+            self.output_file.close()
+
+# Global executor instance
+current_executor = None
 
 @app.route('/')
 def index():
-    return render_template(
-        'index.html',
-        hosts=SYSTEM_HOSTS,
-        default_script_paths=DEFAULT_SCRIPT_PATHS
-    )
+    """Main page"""
+    # Get saved credentials from session
+    username = session.get('username', '')
+    password = session.get('password', '')
+    
+    # Generate default output path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    default_output = os.path.join(DEFAULT_OUTPUT_DIR, f'output_{timestamp}.txt')
+    
+    return render_template('index.html',
+                         hosts=HOSTS,
+                         default_script_path=DEFAULT_SCRIPT_PATH,
+                         default_output_path=default_output,
+                         saved_username=username,
+                         saved_password=password)
 
-@app.route('/get_host_info/<host_key>')
-def get_host_info(host_key):
-    if host_key in SYSTEM_HOSTS:
-        return jsonify(SYSTEM_HOSTS[host_key])
-    return jsonify({"error": "Host not found"}), 404
-
-@app.route('/test_connection', methods=['POST'])
-def test_connection():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        hostname = data.get('hostname')
-        if not all([username, password, hostname]):
-            return jsonify({"success": False, "message": "Missing required fields"})
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(hostname, username=username, password=password, timeout=10)
-        ssh_client.close()
-        return jsonify({"success": True, "message": "Connection successful!"})
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Connection failed: {str(e)}"})
-
-@app.route('/execute', methods=['POST'])
-def execute_script():
-    try:
-        username = request.form['username']
-        password = request.form['password']
-        host_key = request.form['host_selection']
-        custom_hostname = request.form.get('custom_hostname', '').strip()
-        script_path_select = request.form['script_path_select']
-        custom_script_path = request.form.get('custom_script_path', '').strip()
-        parameters = request.form['parameters']
-        output_folder = request.form['output_folder']
-        
-        # Host selection logic
-        if host_key == 'custom':
-            hostname = custom_hostname
-            if not hostname:
-                flash('Custom hostname is required when "Custom Host" is selected!', 'error')
-                return redirect(url_for('index'))
-        else:
-            hostname = SYSTEM_HOSTS[host_key]['hostname']
-        
-        # Script path logic
-        script_path = custom_script_path if script_path_select == 'custom' else script_path_select
-
-        # Validate inputs
-        if not all([username, password, hostname, script_path, output_folder]):
-            flash('All required fields must be filled!', 'error')
-            return redirect(url_for('index'))
-        
-        # Ensure output directory exists
-        os.makedirs(output_folder, exist_ok=True)
-
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+@app.route('/validate', methods=['POST'])
+def validate_inputs():
+    """Validate form inputs"""
+    data = request.json
+    errors = []
+    
+    if not data.get('username'):
+        errors.append('Username is required')
+    
+    if not data.get('password'):
+        errors.append('Password is required')
+    
+    if not data.get('host'):
+        errors.append('Host is required')
+    
+    if not data.get('script_path'):
+        errors.append('Script path is required')
+    
+    if not data.get('output_path'):
+        errors.append('Output path is required')
+    
+    # Validate output directory exists
+    output_dir = os.path.dirname(data.get('output_path', ''))
+    if output_dir and not os.path.exists(output_dir):
         try:
-            ssh_client.connect(hostname, username=username, password=password, timeout=30)
-            # Parameter formatting
-            if parameters:
-                param_list = [p.strip() for p in parameters.split(',') if p.strip()]
-                command = f"{script_path} {' '.join(param_list)}"
-            else:
-                command = script_path
-            logger.info(f"Executing command on {hostname}: {command}")
-            stdin, stdout, stderr = ssh_client.exec_command(command)
-            output = stdout.read().decode('utf-8')
-            error_output = stderr.read().decode('utf-8')
-            exit_status = stdout.channel.recv_exit_status()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"script_output_{hostname.replace('.', '_')}_{timestamp}.txt"
-            output_file_path = os.path.join(output_folder, output_filename)
-            with open(output_file_path, 'w') as f:
-                f.write(f"Remote Script Execution Report\n")
-                f.write(f"=" * 50 + "\n")
-                f.write(f"Host: {hostname}\n")
-                f.write(f"Command: {command}\n")
-                f.write(f"Execution Time: {datetime.now()}\n")
-                f.write(f"Exit Status: {exit_status}\n")
-                f.write(f"=" * 50 + "\n\n")
-                if output:
-                    f.write("STANDARD OUTPUT:\n")
-                    f.write("-" * 20 + "\n")
-                    f.write(output)
-                    f.write("\n\n")
-                if error_output:
-                    f.write("ERROR OUTPUT:\n")
-                    f.write("-" * 20 + "\n")
-                    f.write(error_output)
-                    f.write("\n")
-            if exit_status == 0:
-                flash(f'✅ Script executed successfully! Output saved to: {output_file_path}', 'success')
-            else:
-                flash(f'⚠️ Script executed with exit code {exit_status}. Check output file: {output_file_path}', 'warning')
-        finally:
-            ssh_client.close()
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            errors.append(f'Cannot create output directory: {str(e)}')
+    
+    return jsonify({'valid': len(errors) == 0, 'errors': errors})
+
+@socketio.on('execute_script')
+def handle_execute_script(data):
+    """Handle script execution request"""
+    global current_executor
+    
+    try:
+        # Save credentials to session
+        session['username'] = data['username']
+        session['password'] = data['password']
+        
+        # Clean up previous executor
+        if current_executor:
+            current_executor.cleanup()
+        
+        # Create new executor
+        current_executor = SSHExecutor(
+            host=data['host'],
+            username=data['username'],
+            password=data['password'],
+            script_path=data['script_path'],
+            output_path=data['output_path']
+        )
+        
+        # Execute in separate thread
+        def execute():
+            if current_executor.connect():
+                if current_executor.verify_script():
+                    current_executor.execute_script()
+        
+        execution_thread = threading.Thread(target=execute)
+        execution_thread.daemon = True
+        execution_thread.start()
+        
     except Exception as e:
-        logger.error(f"Error executing script: {str(e)}")
-        flash(f'❌ Error: {str(e)}', 'error')
-    return redirect(url_for('index'))
+        emit('error', {'message': f'Execution failed: {str(e)}'})
+
+@socketio.on('send_input')
+def handle_send_input(data):
+    """Handle user input for the script"""
+    global current_executor
+    
+    if current_executor:
+        user_input = data.get('input', '')
+        current_executor.send_input(user_input)
+
+@socketio.on('stop_execution')
+def handle_stop_execution():
+    """Handle stop execution request"""
+    global current_executor
+    
+    if current_executor:
+        current_executor.cleanup()
+        emit('execution_stopped')
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
-
-
+    print("Starting Remote Script Execution Utility...")
+    print(f"Default script path: {DEFAULT_SCRIPT_PATH}")
+    print(f"Default output directory: {DEFAULT_OUTPUT_DIR}")
+    print(f"Available hosts: {', '.join(HOSTS)}")
+    print("Access the application at: http://localhost:5000")
+    
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
 
 
 --------------
-index
+
 
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remote Script Executor</title>
+    <title>Remote Script Execution Utility</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px;}
-        .container {max-width: 900px; margin: 0 auto; background: white; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); overflow: hidden;}
-        .header {background: linear-gradient(135deg, #2c3e50, #34495e); color: white; padding: 30px; text-align: center;}
-        .header h1 { font-size: 2.5rem; margin-bottom: 10px;}
-        .header p { opacity: 0.9; font-size: 1.1rem;}
-        .form-container {padding: 40px;}
-        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 30px;}
-        .form-group {margin-bottom: 25px;}
-        .form-group.full-width {grid-column: 1 / -1;}
-        label {display: block; margin-bottom: 8px; font-weight: 600; color: #2c3e50; font-size: 0.95rem;}
-        input[type="text"], input[type="password"], select, textarea {width: 100%; padding: 12px; border: 2px solid #e1e8ed; border-radius: 8px; font-size: 14px; transition: all 0.3s ease; background-color: #f8f9fa;}
-        input:focus, select:focus, textarea:focus {outline: none; border-color: #667eea; background-color: white; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);}
-        select {cursor: pointer;}
-        textarea {height: 80px; resize: vertical;}
-        .custom-host-group, #custom_script_path_group {display: none; margin-top: 15px; padding: 15px; background-color: #f1f3f4; border-radius: 8px; border-left: 4px solid #667eea;}
-        .button-group {display: flex; gap: 15px; margin-top: 30px;}
-        .btn {padding: 15px 30px; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s ease; flex: 1;}
-        .btn-primary {background: linear-gradient(135deg, #667eea, #764ba2); color: white;}
-        .btn-primary:hover {transform: translateY(-2px); box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);}
-        .btn-secondary {background-color: #6c757d; color: white;}
-        .btn-secondary:hover {background-color: #5a6268; transform: translateY(-2px);}
-        .btn:disabled {opacity: 0.6; cursor: not-allowed; transform: none !important;}
-        .alert {padding: 15px 20px; margin: 20px 0; border-radius: 8px; font-weight: 500;}
-        .alert-success {background-color: #d4edda; color: #155724; border-left: 4px solid #28a745;}
-        .alert-error {background-color: #f8d7da; color: #721c24; border-left: 4px solid #dc3545;}
-        .alert-warning {background-color: #fff3cd; color: #856404; border-left: 4px solid #ffc107;}
-        .host-info {background-color: #e3f2fd; padding: 10px; border-radius: 6px; margin-top: 8px; font-size: 0.9rem; color: #1565c0;}
-        .connection-status {padding: 10px; border-radius: 6px; margin-top: 10px; font-weight: 500; display: none;}
-        .status-success {background-color: #d4edda; color: #155724;}
-        .status-error {background-color: #f8d7da; color: #721c24;}
-        .folder-input-group {display: flex; gap: 10px;}
-        .folder-input-group input {flex: 1;}
-        .folder-btn {background-color: #6c757d; color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; white-space: nowrap;}
-        .folder-btn:hover {background-color: #5a6268;}
-        .loading {display: none; text-align: center; padding: 20px;}
-        .spinner {border: 4px solid #f3f3f3; border-top: 4px solid #667eea; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 10px;}
-        @keyframes spin {0% { transform: rotate(0deg);} 100% {transform: rotate(360deg);}}
-        @media (max-width: 768px) {.form-grid {grid-template-columns: 1fr; gap: 20px;} .button-group {flex-direction: column;}}
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        .container {
+            padding: 2rem 0;
+        }
+
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+            background: rgba(255, 255, 255, 0.95);
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border-radius: 15px 15px 0 0 !important;
+            padding: 1.5rem;
+        }
+
+        .form-control, .form-select {
+            border-radius: 10px;
+            border: 2px solid #e2e8f0;
+            padding: 0.75rem 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 0.2rem rgba(79, 70, 229, 0.25);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            border: none;
+            border-radius: 10px;
+            padding: 0.75rem 2rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(79, 70, 229, 0.4);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            border: none;
+            border-radius: 10px;
+            padding: 0.75rem 2rem;
+            font-weight: 600;
+        }
+
+        .progress {
+            height: 25px;
+            border-radius: 15px;
+            background: rgba(255, 255, 255, 0.3);
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            transition: width 0.5s ease;
+            border-radius: 15px;
+        }
+
+        #output {
+            background: #1a1a1a;
+            color: #00ff00;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            border-radius: 10px;
+            border: 2px solid #333;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+
+        .input-group {
+            margin-bottom: 1rem;
+        }
+
+        .input-group-text {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border: none;
+            border-radius: 10px 0 0 10px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 0.5rem;
+        }
+
+        .status-disconnected { background-color: #ef4444; }
+        .status-connecting { background-color: #f59e0b; }
+        .status-connected { background-color: #10b981; }
+
+        .alert {
+            border-radius: 10px;
+            border: none;
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .execution-controls {
+            display: none;
+            padding: 1rem;
+            background: rgba(249, 250, 251, 0.8);
+            border-radius: 10px;
+            margin-top: 1rem;
+        }
+
+        .input-prompt {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        #userInput {
+            border: 2px solid #f59e0b;
+        }
+
+        #userInput:focus {
+            border-color: #d97706;
+            box-shadow: 0 0 0 0.2rem rgba(245, 158, 11, 0.25);
+        }
+
+        .spinning {
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🖥️ Remote Script Executor</h1>
-            <p>Execute shell scripts on remote systems with ease</p>
-        </div>
-        <div class="form-container">
-            <!-- FLASHED MESSAGES -->
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="alert alert-{{ 'success' if category == 'success' else 'warning' if category == 'warning' else 'error' }}">
-                            {{ message }}
+        <div class="row justify-content-center">
+            <div class="col-lg-10">
+                <div class="card fade-in">
+                    <div class="card-header text-center">
+                        <h2 class="mb-0">
+                            <i class="fas fa-terminal me-2"></i>
+                            Remote Script Execution Utility
+                        </h2>
+                        <p class="mb-0 mt-2 opacity-75">Execute shell scripts on remote Unix hosts via SSH</p>
+                    </div>
+                    <div class="card-body p-4">
+                        <!-- Connection Status -->
+                        <div class="mb-3">
+                            <span class="status-indicator status-disconnected" id="statusIndicator"></span>
+                            <span id="statusText">Disconnected</span>
                         </div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
-            <form method="POST" action="/execute" id="executorForm">
-                <div class="form-grid">
-                    <!-- User -->
-                    <div class="form-group">
-                        <label for="username">👤 Username:</label>
-                        <input type="text" id="username" name="username" required>
-                    </div>
-                    <!-- Password -->
-                    <div class="form-group">
-                        <label for="password">🔒 Password:</label>
-                        <input type="password" id="password" name="password" required>
-                    </div>
-                    <!-- Host dropdown -->
-                    <div class="form-group full-width">
-                        <label for="host_selection">🌐 System Host:</label>
-                        <select id="host_selection" name="host_selection" required>
-                            <option value="">Select a system host...</option>
-                            {% for key, host in hosts.items() %}
-                                <option value="{{ key }}" data-hostname="{{ host.hostname }}" data-description="{{ host.description }}">
-                                    {{ host.description }}{% if host.hostname %} ({{ host.hostname }}){% endif %}
-                                </option>
-                            {% endfor %}
-                        </select>
-                        <div id="host-info" class="host-info" style="display: none;"></div>
-                        <div id="custom-host-group" class="custom-host-group">
-                            <label for="custom_hostname">Enter Custom Hostname:</label>
-                            <input type="text" id="custom_hostname" name="custom_hostname" placeholder="192.168.1.100 or server.example.com">
+
+                        <!-- Main Form -->
+                        <form id="executionForm">
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="input-group mb-3">
+                                        <span class="input-group-text">
+                                            <i class="fas fa-user"></i>
+                                        </span>
+                                        <input type="text" class="form-control" id="username" 
+                                               placeholder="SSH Username" value="{{ saved_username }}" required>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="input-group mb-3">
+                                        <span class="input-group-text">
+                                            <i class="fas fa-lock"></i>
+                                        </span>
+                                        <input type="password" class="form-control" id="password" 
+                                               placeholder="SSH Password" value="{{ saved_password }}" required>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="input-group mb-3">
+                                        <span class="input-group-text">
+                                            <i class="fas fa-server"></i>
+                                        </span>
+                                        <select class="form-select" id="host" required>
+                                            <option value="">Select Host</option>
+                                            {% for host in hosts %}
+                                            <option value="{{ host }}">{{ host }}</option>
+                                            {% endfor %}
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="input-group mb-3">
+                                        <span class="input-group-text">
+                                            <i class="fas fa-file-code"></i>
+                                        </span>
+                                        <input type="text" class="form-control" id="scriptPath" 
+                                               placeholder="Remote Script Path" value="{{ default_script_path }}" required>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="input-group mb-3">
+                                <span class="input-group-text">
+                                    <i class="fas fa-save"></i>
+                                </span>
+                                <input type="text" class="form-control" id="outputPath" 
+                                       placeholder="Local Output File Path" value="{{ default_output_path }}" required>
+                            </div>
+
+                            <!-- Execute Button -->
+                            <div class="text-center mb-4">
+                                <button type="submit" class="btn btn-primary btn-lg me-3" id="executeBtn">
+                                    <i class="fas fa-play me-2"></i>Execute Script
+                                </button>
+                                <button type="button" class="btn btn-danger btn-lg" id="stopBtn" style="display: none;">
+                                    <i class="fas fa-stop me-2"></i>Stop Execution
+                                </button>
+                            </div>
+                        </form>
+
+                        <!-- Progress Bar -->
+                        <div class="mb-4" id="progressContainer" style="display: none;">
+                            <div class="progress">
+                                <div class="progress-bar" id="progressBar" role="progressbar" 
+                                     style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                                    <span id="progressText">Ready</span>
+                                </div>
+                            </div>
                         </div>
-                        <div id="connection-status" class="connection-status"></div>
-                    </div>
-                    <!-- Script path (dropdown + manual input) -->
-                    <div class="form-group">
-                        <label for="script_path_select">📄 Script Path:</label>
-                        <select id="script_path_select" name="script_path_select" required onchange="scriptPathChanged()">
-                            {% for item in default_script_paths %}
-                                <option value="{{ item.value }}">{{ item.label }}</option>
-                            {% endfor %}
-                            <option value="custom">Other (enter manually)</option>
-                        </select>
-                        <div id="custom_script_path_group" style="display:none; margin-top:10px;">
-                            <input type="text" id="custom_script_path" name="custom_script_path" placeholder="/path/to/script.sh">
+
+                        <!-- Error Messages -->
+                        <div id="errorContainer"></div>
+
+                        <!-- Execution Controls -->
+                        <div class="execution-controls" id="executionControls">
+                            <div id="inputPrompt" class="input-prompt" style="display: none;"></div>
+                            <div class="input-group" id="inputGroup" style="display: none;">
+                                <input type="text" class="form-control" id="userInput" 
+                                       placeholder="Enter your input here...">
+                                <button class="btn btn-warning" type="button" id="sendInputBtn">
+                                    <i class="fas fa-paper-plane"></i> Send
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                    <!-- Parameters -->
-                    <div class="form-group">
-                        <label for="parameters">⚙️ Parameters:</label>
-                        <textarea id="parameters" name="parameters" placeholder="param1, param2, param3"></textarea>
-                        <small style="color: #6c757d;">Comma-separated parameters</small>
-                    </div>
-                    <!-- Output folder -->
-                    <div class="form-group full-width">
-                        <label for="output_folder">📁 Output Folder:</label>
-                        <div class="folder-input-group">
-                            <input type="text" id="output_folder" name="output_folder" placeholder="/path/to/output/folder" required>
-                            <button type="button" class="folder-btn" onclick="selectFolder()">Browse</button>
+
+                        <!-- Output Display -->
+                        <div class="mt-4">
+                            <h5><i class="fas fa-terminal me-2"></i>Script Output</h5>
+                            <div id="output" class="form-control p-3">Waiting for execution...</div>
                         </div>
                     </div>
                 </div>
-                <div class="button-group">
-                    <button type="button" class="btn btn-secondary" id="testConnectionBtn">🔌 Test Connection</button>
-                    <button type="submit" class="btn btn-primary" id="fetchBtn">🚀 Fetch & Execute</button>
-                </div>
-            </form>
-            <div id="loading" class="loading">
-                <div class="spinner"></div>
-                <p>Executing script on remote host...</p>
             </div>
         </div>
     </div>
+
+    <!-- Scripts -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    
     <script>
-        // HOST SELECTION: Handle dropdown logic
-        document.getElementById('host_selection').addEventListener('change', function() {
-            const selectedOption = this.options[this.selectedIndex];
-            const customHostGroup = document.getElementById('custom-host-group');
-            const hostInfo = document.getElementById('host-info');
-            const connectionStatus = document.getElementById('connection-status');
-            connectionStatus.style.display = 'none';
-            if (this.value === 'custom') {
-                customHostGroup.style.display = 'block';
-                hostInfo.style.display = 'none';
-            } else if (this.value) {
-                customHostGroup.style.display = 'none';
-                const hostname = selectedOption.dataset.hostname;
-                const description = selectedOption.dataset.description;
-                hostInfo.innerHTML = `<strong>${description}</strong><br>Hostname: ${hostname}`;
-                hostInfo.style.display = 'block';
-            } else {
-                customHostGroup.style.display = 'none';
-                hostInfo.style.display = 'none';
-            }
-        });
+        // Initialize Socket.IO
+        const socket = io();
+        
+        // DOM elements
+        const form = document.getElementById('executionForm');
+        const executeBtn = document.getElementById('executeBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const output = document.getElementById('output');
+        const errorContainer = document.getElementById('errorContainer');
+        const executionControls = document.getElementById('executionControls');
+        const inputPrompt = document.getElementById('inputPrompt');
+        const inputGroup = document.getElementById('inputGroup');
+        const userInput = document.getElementById('userInput');
+        const sendInputBtn = document.getElementById('sendInputBtn');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const statusText = document.getElementById('statusText');
 
-        // SCRIPT PATH: Handle dropdown/manual input logic
-        function scriptPathChanged() {
-            const select = document.getElementById('script_path_select');
-            const customGroup = document.getElementById('custom_script_path_group');
-            if (select.value === 'custom') {
-                customGroup.style.display = "block";
-                document.getElementById('custom_script_path').required = true;
-            } else {
-                customGroup.style.display = "none";
-                document.getElementById('custom_script_path').required = false;
-            }
-        }
-        document.addEventListener('DOMContentLoaded', function () {
-            scriptPathChanged();
-        });
+        let isExecuting = false;
 
-        // CONNECTION TEST BUTTON
-        document.getElementById('testConnectionBtn').addEventListener('click', async function() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const hostSelection = document.getElementById('host_selection').value;
-            const customHostname = document.getElementById('custom_hostname').value;
-            let hostname = "";
-            if (hostSelection === 'custom') {
-                hostname = customHostname;
-            } else if (hostSelection) {
-                const selectedOption = document.getElementById('host_selection').options[document.getElementById('host_selection').selectedIndex];
-                hostname = selectedOption.dataset.hostname;
-            }
-            if (!username || !password || !hostname) {
-                alert('Please fill in username, password, and select a host first.');
-                return;
-            }
-            const connectionStatus = document.getElementById('connection-status');
-            connectionStatus.innerHTML = 'Testing connection...';
-            connectionStatus.className = 'connection-status';
-            connectionStatus.style.display = 'block';
-            this.disabled = true;
+        // Form submission
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            if (isExecuting) return;
+
+            const formData = {
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+                host: document.getElementById('host').value,
+                script_path: document.getElementById('scriptPath').value,
+                output_path: document.getElementById('outputPath').value
+            };
+
+            // Validate inputs
             try {
-                const response = await fetch('/test_connection', {
+                const response = await fetch('/validate', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        username: username,
-                        password: password,
-                        hostname: hostname
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
                 });
+                
                 const result = await response.json();
-                if (result.success) {
-                    connectionStatus.innerHTML = `✅ ${result.message}`;
-                    connectionStatus.className = 'connection-status status-success';
-                } else {
-                    connectionStatus.innerHTML = `❌ ${result.message}`;
-                    connectionStatus.className = 'connection-status status-error';
+                
+                if (!result.valid) {
+                    showError(result.errors.join('<br>'));
+                    return;
                 }
             } catch (error) {
-                connectionStatus.innerHTML = `❌ Connection test failed: ${error.message}`;
-                connectionStatus.className = 'connection-status status-error';
+                showError('Validation failed: ' + error.message);
+                return;
             }
-            this.disabled = false;
+
+            // Clear previous output and errors
+            clearError();
+            output.textContent = 'Starting execution...\n';
+            
+            // Start execution
+            startExecution();
+            socket.emit('execute_script', formData);
         });
 
-        // LOADING INDICATOR ON SUBMIT
-        document.getElementById('executorForm').addEventListener('submit', function(e) {
-            const loading = document.getElementById('loading');
-            const fetchBtn = document.getElementById('fetchBtn');
-            loading.style.display = 'block';
-            fetchBtn.disabled = true;
-            setTimeout(() => {
-                loading.style.display = 'none';
-                fetchBtn.disabled = false;
-            }, 30000); // Safeguard timeout
+        // Stop button
+        stopBtn.addEventListener('click', () => {
+            socket.emit('stop_execution');
+            stopExecution();
         });
 
-        // FOLDER SELECT
-        function selectFolder() {
-            const currentPath = document.getElementById('output_folder').value || '/home/user/output';
-            const newPath = prompt('Enter the full path to output folder:', currentPath);
-            if (newPath && newPath.trim()) {
-                document.getElementById('output_folder').value = newPath.trim();
+        // Send input button
+        sendInputBtn.addEventListener('click', () => {
+            sendUserInput();
+        });
+
+        // Enter key for input
+        userInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendUserInput();
+            }
+        });
+
+        function sendUserInput() {
+            const input = userInput.value.trim();
+            if (input) {
+                socket.emit('send_input', { input: input });
+                userInput.value = '';
+                hideInputPrompt();
             }
         }
 
-        // Autofocus first input
-        document.addEventListener('DOMContentLoaded', function() {
-            document.getElementById('username').focus();
+        function startExecution() {
+            isExecuting = true;
+            executeBtn.disabled = true;
+            executeBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Executing...';
+            stopBtn.style.display = 'inline-block';
+            progressContainer.style.display = 'block';
+            executionControls.style.display = 'block';
+            
+            updateStatus('connecting', 'Connecting...');
+        }
+
+        function stopExecution() {
+            isExecuting = false;
+            executeBtn.disabled = false;
+            executeBtn.innerHTML = '<i class="fas fa-play me-2"></i>Execute Script';
+            stopBtn.style.display = 'none';
+            hideInputPrompt();
+            
+            updateStatus('disconnected', 'Disconnected');
+        }
+
+        function updateStatus(status, text) {
+            statusIndicator.className = `status-indicator status-${status}`;
+            statusText.textContent = text;
+        }
+
+        function showInputPrompt(prompt) {
+            inputPrompt.textContent = prompt;
+            inputPrompt.style.display = 'block';
+            inputGroup.style.display = 'flex';
+            userInput.focus();
+        }
+
+        function hideInputPrompt() {
+            inputPrompt.style.display = 'none';
+            inputGroup.style.display = 'none';
+        }
+
+        function showError(message) {
+            errorContainer.innerHTML = `
+                <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    ${message}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            `;
+        }
+
+        function clearError() {
+            errorContainer.innerHTML = '';
+        }
+
+        // Socket event handlers
+        socket.on('progress', (data) => {
+            progressBar.style.width = data.percent + '%';
+            progressBar.setAttribute('aria-valuenow', data.percent);
+            progressText.textContent = data.message;
+            
+            if (data.percent >= 15) {
+                updateStatus('connected', 'Connected');
+            }
+        });
+
+        socket.on('output', (data) => {
+            output.textContent += data.data;
+            output.scrollTop = output.scrollHeight;
+        });
+
+        socket.on('waiting_for_input', (data) => {
+            showInputPrompt(data.prompt);
+        });
+
+        socket.on('execution_complete', () => {
+            stopExecution();
+            progressBar.style.width = '100%';
+            progressText.textContent = 'Completed';
+            output.textContent += '\n=== Script execution completed ===\n';
+            output.scrollTop = output.scrollHeight;
+        });
+
+        socket.on('execution_stopped', () => {
+            stopExecution();
+            output.textContent += '\n=== Script execution stopped ===\n';
+            output.scrollTop = output.scrollHeight;
+        });
+
+        socket.on('error', (data) => {
+            showError(data.message);
+            stopExecution();
+        });
+
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Disconnected from server');
+            if (isExecuting) {
+                stopExecution();
+                showError('Connection to server lost');
+            }
         });
     </script>
 </body>
 </html>
+
+-------------
+requirements.txt
+
+Flask==2.3.3
+Flask-Session==0.5.0
+Flask-SocketIO==5.3.6
+paramiko==3.3.1
+python-socketio==5.8.0
+python-engineio==4.7.1
+Werkzeug==2.3.7
+
+
+pip install -r requirements.txt
